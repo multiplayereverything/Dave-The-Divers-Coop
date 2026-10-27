@@ -178,7 +178,7 @@ internal sealed class MissionProgressReplicator
                     _clientRosterIds.Contains(pair.Key),
                     pair.Value.State))
                 continue;
-            var mission = MissionManager.Instance?.GetMissionData(pair.Key);
+            var mission = (MissionManager.hasInstance ? MissionManager.Instance : null)?.GetMissionData(pair.Key);
             if (mission == null)
                 continue;
             var local = Capture(mission, pair.Value.Revision);
@@ -225,7 +225,7 @@ internal sealed class MissionProgressReplicator
 
     private void PublishHostChanges(UdpSession session, bool keyframe, bool fullKeyframe)
     {
-        var manager = MissionManager.Instance;
+        var manager = (MissionManager.hasInstance ? MissionManager.Instance : null);
         if (manager == null)
             return;
         try
@@ -290,7 +290,7 @@ internal sealed class MissionProgressReplicator
     {
         try
         {
-            var manager = MissionManager.Instance;
+            var manager = (MissionManager.hasInstance ? MissionManager.Instance : null);
             if (manager == null)
                 return false;
             _clientRosterIds.Clear();
@@ -377,7 +377,7 @@ internal sealed class MissionProgressReplicator
     {
         try
         {
-            var manager = MissionManager.Instance;
+            var manager = (MissionManager.hasInstance ? MissionManager.Instance : null);
             var mission = manager?.GetMissionData(state.MissionId);
             if (mission == null)
                 return false;
@@ -454,7 +454,7 @@ internal sealed class MissionProgressReplicator
         if (_clientOriginals.Count == 0)
             return;
         var restored = new List<int>();
-        if (MissionManager.Instance != null)
+        if ((MissionManager.hasInstance ? MissionManager.Instance : null) != null)
         {
             foreach (var pair in _clientOriginals)
                 if (ApplyClientState(pair.Value, preserveOriginal: false))
@@ -470,7 +470,7 @@ internal sealed class MissionProgressReplicator
     {
         try
         {
-            var manager = MissionManager.Instance;
+            var manager = (MissionManager.hasInstance ? MissionManager.Instance : null);
             if (manager == null)
                 return;
             manager.OrderInProgressList();

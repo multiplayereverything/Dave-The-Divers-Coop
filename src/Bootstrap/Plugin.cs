@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.18.3")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.19.0")]
 public sealed class Plugin : BasePlugin
 {
     private static ConfigEntry<SessionRole> _roleConfig;
@@ -24,6 +24,8 @@ public sealed class Plugin : BasePlugin
         HarmonyCompatibilityReporter.SelfTest();
         ControllerScopePolicy.SelfTest();
         UdpSession.SelfTest();
+        SteamP2P.SelfTest();
+        DiveLayoutSync.SelfTest();
         ProbeBehaviour.SelfTest();
         LobbyInput.SelfTest();
         TitleOnlineMenu.SelfTest();
@@ -56,6 +58,7 @@ public sealed class Plugin : BasePlugin
         _playerNameConfig = Config.Bind("Network", "PlayerName", string.Empty,
             "Name shown above your diver; blank uses the Steam name");
 
+        LabMode.Init(Log, new Harmony("dev.davethedivermp.lab"));
         ProbeBehaviour.Logger = Log;
         ProbeBehaviour.Role = _roleConfig.Value;
         ProbeBehaviour.Address = _addressConfig.Value;

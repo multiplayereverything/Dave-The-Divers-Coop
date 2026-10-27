@@ -46,6 +46,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private string _unsupportedControllerName = string.Empty;
     internal UdpSession _session;
     private FishReplicator _fishReplicator;
+    internal FishReplicator LabFishReplicator => _fishReplicator;
+    internal uint LabSceneId => _sceneId;
     private PickupReplicator _pickupReplicator;
     private SceneReplicator _sceneReplicator;
     private MissionProgressReplicator _missionProgressReplicator;
@@ -118,6 +120,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     {
         Instance = this;
         Application.runInBackground = true;
+        LabMode.Apply();
         _buildId = Protocol.SceneId(
             $"{Application.buildGUID}|{Application.version}|{Application.unityVersion}|" +
             typeof(Plugin).Module.ModuleVersionId);
@@ -176,11 +179,43 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void Update()
     {
+        try
+        {
+            LabMode.Tick(this);
+        }
+        catch (Exception exception)
+        {
+            Logger.LogError($"LAB tick failed: {exception}");
+        }
+        // One failing subsystem used to throw out of Update every frame, skipping everything after it (and, on a
+        // scene change, re-running the change forever). Log it once per message and keep the frame going.
+        try
+        {
+            UpdateFrame();
+        }
+        catch (Exception exception)
+        {
+            var key = exception.GetType().Name + exception.Message;
+            var now = Time.realtimeSinceStartup;
+            if (!_updateFailures.TryGetValue(key, out var next) || now >= next)
+            {
+                _updateFailures[key] = now + 30f;
+                Logger.LogError($"Update failed (logged once per 30 s): {exception}");
+            }
+        }
+    }
+
+    private readonly Dictionary<string, float> _updateFailures = new();
+
+    private void UpdateFrame()
+    {
         var activeScene = SceneManager.GetActiveScene();
         var scene = activeScene.name;
         if (scene != _scene || activeScene.handle != _sceneHandle)
         {
             var wasDiveScene = _sceneMetadata.CanDive;
+            _scene = scene;
+            _sceneHandle = activeScene.handle;
             _managerEventReplicator?.OnSceneChanged(Role);
             _npcInteractionCoordinator?.Clear(Role, _session);
             if (_showLobby)
@@ -313,7 +348,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
         {
             var renderer = _playerRenderer ?? _lobbyRenderer ?? _sushiRenderer;
-            if (renderer != null && _session.SceneMatches(_sceneId) && snapshot.SceneId == _sceneId)
+            if (renderer != null && _session.SceneMatches(_sceneId) && snapshot.SceneId == _sceneId &&
+                !LabMode.IsMutant("puppet"))
                 _remoteAvatar.Apply(snapshot, renderer, _session.RemoteName, IsDiveScene());
             else
                 _remoteAvatar.Clear();
@@ -418,7 +454,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             var unsupported = ControllerScopePolicy.FindActiveUnsupported();
             if (unsupported != null)
             {
-                var typeName = unsupported.GetType().Name;
+                var typeName = Il2CppNames.Name(unsupported);
                 var changed = _unsupportedControllerName != typeName;
                 _unsupportedControllerName = typeName;
                 _playerPresent = true;

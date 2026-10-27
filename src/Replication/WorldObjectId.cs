@@ -31,13 +31,13 @@ internal static class WorldObjectId
             return ForFallback(component, discriminator);
         var sceneId = Protocol.SceneId(component.gameObject.scene.name);
         return ForNativeKey(
-            sceneId, discriminator, component.GetType().FullName ?? component.name, nativeKey);
+            sceneId, discriminator, Il2CppNames.FullName(component) ?? component.name, nativeKey);
     }
 
     private static uint ForFallback(Component component, int discriminator)
     {
         var sceneId = Protocol.SceneId(component.gameObject.scene.name);
-        var hash = BeginHash(sceneId, discriminator, component.GetType().FullName ?? component.name);
+        var hash = BeginHash(sceneId, discriminator, Il2CppNames.FullName(component) ?? component.name);
         for (var current = component.transform; current != null; current = current.parent)
         {
             hash = Mix(hash, unchecked((int)Protocol.SceneId(current.name)));

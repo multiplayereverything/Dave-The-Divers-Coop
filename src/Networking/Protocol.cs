@@ -71,7 +71,8 @@ internal enum PacketType : byte
 internal enum HandshakeRejectReason : byte
 {
     IncompatibleProtocol = 1,
-    IncompatibleBuild = 2
+    IncompatibleBuild = 2,
+    RoomFull = 3
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -668,7 +669,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 55;
+    private const byte Version = 56;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
     private const int DiverRuntimePayloadSize = 50;

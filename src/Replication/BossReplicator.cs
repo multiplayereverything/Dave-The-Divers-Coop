@@ -234,7 +234,7 @@ internal sealed class BossReplicator
         BossControllerBase boss)
     {
         if (role != SessionRole.Host || session == null || !session.Connected || boss == null ||
-            !session.SceneMatches(sceneId) || !IsSnapshotFamily(boss.GetType().Name))
+            !session.SceneMatches(sceneId) || !IsSnapshotFamily(Il2CppNames.Name(boss)))
             return;
         ScanHost(sceneId);
         SendHostStates(session, sceneId, Time.unscaledTime, true);
@@ -281,7 +281,7 @@ internal sealed class BossReplicator
         {
             if (boss == null || !boss.gameObject.scene.IsValid())
                 continue;
-            if (!IsSnapshotFamily(boss.GetType().Name))
+            if (!IsSnapshotFamily(Il2CppNames.Name(boss)))
             {
                 ReportUnsupportedFamily(boss);
                 continue;
@@ -308,7 +308,7 @@ internal sealed class BossReplicator
         {
             if (boss == null || !boss.gameObject.scene.IsValid())
                 continue;
-            if (!IsSnapshotFamily(boss.GetType().Name))
+            if (!IsSnapshotFamily(Il2CppNames.Name(boss)))
             {
                 ReportUnsupportedFamily(boss);
                 continue;
@@ -339,7 +339,7 @@ internal sealed class BossReplicator
                 Animator = boss.GetComponentInChildren<Animator>(true)
             };
             SuppressClientSimulation(_clientTargets[id]);
-            _log.LogInfo($"Network boss bound: {boss.GetType().Name}; id={id:X8}");
+            _log.LogInfo($"Network boss bound: {Il2CppNames.Name(boss)}; id={id:X8}");
         }
     }
 
@@ -360,7 +360,7 @@ internal sealed class BossReplicator
     {
         if (boss != null && _reportedUnsupportedFamilies.Add(boss.GetInstanceID()))
             _log.LogWarning(
-                $"Network boss replication disabled for unsupported family: {boss.GetType().Name}");
+                $"Network boss replication disabled for unsupported family: {Il2CppNames.Name(boss)}");
     }
 
     private static bool IsSnapshotFamily(string typeName) =>
@@ -389,11 +389,11 @@ internal sealed class BossReplicator
 
     private static bool IsHostOnlyBoss(MonoBehaviour boss)
     {
-        if (boss == null || IsSnapshotFamily(boss.GetType().Name))
+        if (boss == null || IsSnapshotFamily(Il2CppNames.Name(boss)))
             return false;
-        if (boss is BossControllerBase || IsKnownHostOnlyFamily(boss.GetType().Name))
+        if (boss.TryCast<BossControllerBase>() != null || IsKnownHostOnlyFamily(Il2CppNames.Name(boss)))
             return true;
-        for (var type = boss.GetType().BaseType; type != null; type = type.BaseType)
+        for (var type = boss.GetIl2CppType().BaseType; type != null; type = type.BaseType)
             if (type.Name.StartsWith("SABossControllerBase`", StringComparison.Ordinal))
                 return true;
         return false;
@@ -415,7 +415,7 @@ internal sealed class BossReplicator
             if (_reportedHostOnlyFamilies.Add(boss.GetInstanceID()))
                 _log.LogWarning(
                     $"Network boss is host-only until its native damage ABI is proven: " +
-                    boss.GetType().Name);
+                    Il2CppNames.Name(boss));
         }
     }
 

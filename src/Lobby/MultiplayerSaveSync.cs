@@ -43,6 +43,9 @@ internal static class MultiplayerSaveSync
         Path.Combine(Paths.ConfigPath, "DaveTheDiverMP.mp-slot");
     private static readonly string MpSlotPendingPath = MpSlotMarkerPath + ".pending";
     private static readonly string MpSlotBackupPath = MpSlotMarkerPath + ".backup";
+    // Written when DTMP loads slot 7 for a shared campaign. The game then saves into that slot during play, so the
+    // slot no longer matches the marker; with this note present that change is ours, not a player's own save.
+    private static readonly string MpSlotLoadedPath = MpSlotMarkerPath + ".loaded";
 
     private sealed class SlotMarker
     {
@@ -300,7 +303,10 @@ internal static class MultiplayerSaveSync
         {
             ThrowIfSelfTestFailure(SaveFailurePoint.Load);
             if (save.LoadGameDataFromSlot(MpSlotIndex, MpSlotType))
+            {
+                NoteSlotLoaded(log);
                 return true;
+            }
             _status = "Could not load MP save slot";
             log?.LogWarning("MP save sync: host MP slot load failed");
         }
@@ -415,6 +421,8 @@ internal static class MultiplayerSaveSync
             }
             Array.Copy(chunk, 0, bytes, (int)offset, chunk.Length);
         }
+        if (LabMode.IsMutant("save") && bytes.Length > 0)
+            bytes[bytes.Length / 2] ^= 0x5A; // lab: a corrupted transfer must be refused
         if (Fingerprint(bytes) != _clientFingerprint)
         {
             RejectClientSave(session, "Host save checksum mismatch");
@@ -493,6 +501,8 @@ internal static class MultiplayerSaveSync
                 return;
             }
             _clientLoaded = loaded;
+            if (loaded)
+                NoteSlotLoaded(log);
             _status = _clientLoaded ? "Host save synced" : "Could not load host save";
             session.SendSaveSnapshotAck(new SaveSnapshotAck(
                 _clientTransferId, _clientFingerprint, _clientLoaded));
@@ -757,6 +767,26 @@ internal static class MultiplayerSaveSync
                 }
                 log?.LogInfo("MP save sync: migrated schema-2 slot marker");
                 return true;
+            }
+            if (!LabMode.IsMutant("slot-reclaim"))
+            {
+                // A valid DTMP marker means DTMP wrote slot 7; the game then saves the shared campaign into that
+                // slot during play (".loaded" notes it). Before this, every later session was refused ("changed
+                // outside DTMP"). The current contents are kept in a timestamped copy before the slot is reused.
+                try
+                {
+                    WriteAtomicBytes(
+                        $"{MpSlotMarkerPath}.reclaimed-{DateTime.UtcNow:yyyyMMddHHmmss}", current);
+                    WriteMarker(CreateMarker(currentFingerprint, string.Empty));
+                    log?.LogInfo(
+                        "MP save sync: reclaimed slot 7 (saved by the game after DTMP wrote it" +
+                        (File.Exists(MpSlotLoadedPath) ? ", during a shared session)" : ")"));
+                    return true;
+                }
+                catch (Exception exception)
+                {
+                    log?.LogWarning($"MP save sync: slot 7 reclaim failed: {exception.Message}");
+                }
             }
             RefuseOccupiedSlot(log, "slot contents differ from the last verified DTMP write");
             return false;
@@ -1134,6 +1164,18 @@ internal static class MultiplayerSaveSync
         if (bytes.Length == 0 || bytes.Length > MaxMetadataBytes)
             throw new InvalidDataException("metadata size is invalid");
         WriteAtomicBytes(path, bytes);
+    }
+
+    private static void NoteSlotLoaded(ManualLogSource log)
+    {
+        try
+        {
+            WriteAtomicText(MpSlotLoadedPath, DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+        }
+        catch (Exception exception)
+        {
+            log?.LogWarning($"MP save sync: could not note the loaded slot: {exception.Message}");
+        }
     }
 
     private static void WriteMarker(SlotMarker marker)

@@ -5,6 +5,7 @@ using BepInEx.Logging;
 using DR.GameData;
 using DR.Save;
 using HarmonyLib;
+using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.InteropTypes;
 using SushiBar.QTE;
 using TMPro;
@@ -111,6 +112,9 @@ internal sealed class ManagerEventReplicator
     private const int DialogueVoteSkip = 2;
     private const int DialogueVoteFinish = 3;
     private const int DialogueVoteChoiceBase = 4;
+    // Sent once by a client that can't show the host's dialogue (spectator fallback, or the native start threw):
+    // the host then advances that bundle on its own vote. Without it both waited at 1/2 forever.
+    private const int DialogueVoteSpectator = 0x7f;
 
     private enum RestoreDecision
     {
@@ -267,6 +271,7 @@ internal sealed class ManagerEventReplicator
     private Il2CppSystem.Action<QTEResult, int> _pendingClientDrinkCallback;
     private bool _wasConnected;
     private bool _storySnapshotPublished;
+    private int _storySnapshotsSent;
     private float _nextStoryScan;
     private float _nextStorySafetyKeyframe;
     private int _hostCurrentChapter = int.MinValue;
@@ -328,6 +333,7 @@ internal sealed class ManagerEventReplicator
     private PendingDialogueStart _pendingClientDialogueStart;
     private bool _clientScenarioSpectating;
     private bool _clientDialogueSpectating;
+    private int _clientSpectatorBundleKey;
     private int _hostPhoneTid;
     private int _clientPhoneTid;
     private int _pendingClientPhoneTid;
@@ -729,12 +735,13 @@ internal sealed class ManagerEventReplicator
             _activeSessionSnapshotPublished = false;
         }
         _wasConnected = true;
+        _spectatorSession = session;
         FlushOutbound(session);
 
         if (role == SessionRole.Host)
         {
             PublishManagementPanelChanges(session);
-            TryAcceptScenarioStart(ScenarioManager.Instance, session);
+            TryAcceptScenarioStart((ScenarioManager.hasInstance ? ScenarioManager.Instance : null), session);
             ObserveLiveHostDialogue(session);
         }
 
@@ -750,7 +757,7 @@ internal sealed class ManagerEventReplicator
             if (_storySnapshotPublished)
             {
                 _nextStoryScan = now + 1f;
-                _nextStorySafetyKeyframe = now + 5f;
+                _nextStorySafetyKeyframe = now + (_storySnapshotsSent++ == 0 ? 5f : 60f);
             }
         }
         if (role == SessionRole.Host && _storySnapshotPublished && now >= _nextStoryScan)
@@ -764,8 +771,11 @@ internal sealed class ManagerEventReplicator
                 _nextStorySafetyKeyframe,
                 now))
         {
+            // The full story snapshot is one reliable packet per cleared event/cutscene; re-sending it every 5 s
+            // flooded the reliable lane (and made the client briefly see an empty story after ResetEvents).
+            // Diffs go out every second, so a full keyframe is only a slow safety net after the first one.
             ForceHostStoryKeyframe();
-            _nextStorySafetyKeyframe = now + 5f;
+            _nextStorySafetyKeyframe = now + 60f;
         }
         if (role == SessionRole.Host && now >= _nextDayScan)
         {
@@ -924,7 +934,7 @@ internal sealed class ManagerEventReplicator
         if (_applying || _suppressPublish > 0 || session == null || !session.Connected)
             return true;
         if (domain == ManagerDomain.Dialogue &&
-            IsLocalDialogueBundle(DialogueManager.Instance?.CurrentBundleID))
+            IsLocalDialogueBundle((DialogueManager.hasInstance ? DialogueManager.Instance : null)?.CurrentBundleID))
             return true;
         if (domain == ManagerDomain.Dialogue &&
             action is ManagerAction.Continue or ManagerAction.Skip or
@@ -966,7 +976,7 @@ internal sealed class ManagerEventReplicator
         int bundleKey,
         int context)
     {
-        var manager = DialogueManager.Instance;
+        var manager = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
         var liveBundleKey = ContentKey(manager?.CurrentBundleID);
         var nodeIndex = manager?.m_CurrentDialogueIndex ?? -1;
         var voteScope = DialogueVoteScope(manager);
@@ -1434,12 +1444,12 @@ internal sealed class ManagerEventReplicator
         role != SessionRole.Client || session == null || !session.Connected;
 
     internal bool AllowDialogueAdvance(SessionRole role, UdpSession session) =>
-        _applying || IsLocalDialogueBundle(DialogueManager.Instance?.CurrentBundleID) ||
+        _applying || IsLocalDialogueBundle((DialogueManager.hasInstance ? DialogueManager.Instance : null)?.CurrentBundleID) ||
         ProbeBehaviour.Instance?.HasActiveNpcLease == true ||
         role != SessionRole.Client || session == null || !session.Connected;
 
     internal bool AllowDialogueChoice(SessionRole role, UdpSession session) =>
-        _applying || IsLocalDialogueBundle(DialogueManager.Instance?.CurrentBundleID) ||
+        _applying || IsLocalDialogueBundle((DialogueManager.hasInstance ? DialogueManager.Instance : null)?.CurrentBundleID) ||
         role != SessionRole.Client || session == null || !session.Connected;
 
     internal bool InterceptPhoneCall(
@@ -1494,7 +1504,7 @@ internal sealed class ManagerEventReplicator
         IsTerminalAllowed(role, session?.Connected == true, _applyingScenarioAuthority);
 
     internal bool AllowDialogueTerminal(SessionRole role, UdpSession session) =>
-        IsLocalDialogueBundle(DialogueManager.Instance?.CurrentBundleID) ||
+        IsLocalDialogueBundle((DialogueManager.hasInstance ? DialogueManager.Instance : null)?.CurrentBundleID) ||
         ProbeBehaviour.Instance?.HasActiveNpcLease == true ||
         IsTerminalAllowed(role, session?.Connected == true, _applyingDialogueAuthority);
 
@@ -1778,7 +1788,7 @@ internal sealed class ManagerEventReplicator
             ContentKey(invocation.BundleId) == key ? invocation : null;
         _pendingHostDialogueInvocation = null;
         _hostDialogueInvocation ??= CreateLiveDialogueInvocation(
-            DialogueManager.Instance, bundleId);
+            (DialogueManager.hasInstance ? DialogueManager.Instance : null), bundleId);
         ResetDialogueVotes();
         ResetDialogueCommit();
         _log?.LogInfo(
@@ -1850,7 +1860,7 @@ internal sealed class ManagerEventReplicator
 
     private void ObserveLiveHostDialogue(UdpSession session)
     {
-        var manager = DialogueManager.Instance;
+        var manager = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
         var bundleId = manager?.CurrentBundleID;
         var bundleKey = ContentKey(bundleId);
         if (bundleKey != 0)
@@ -1898,9 +1908,25 @@ internal sealed class ManagerEventReplicator
             PackDialogueVotes(
                 _dialogueVoteScope, _hostDialogueVote, _clientDialogueVote));
 
+    private UdpSession _spectatorSession;
+
+    private void SendDialogueSpectator(int bundleKey)
+    {
+        var session = _spectatorSession;
+        if (session?.Connected != true || bundleKey == 0)
+            return;
+        TryQueueOutbound(session, new ManagerEvent(
+            0, 0, CurrentTick(), (byte)ManagerDomain.Dialogue,
+            (byte)ManagerAction.DialogueVote, bundleKey,
+            PackDialogueVotes(0, 0, DialogueVoteSpectator)));
+        FlushOutbound(session);
+    }
+
     private void TryCommitDialogueVotes(UdpSession session, DialogueManager manager)
     {
-        if (!DialogueVotesMatch(_hostDialogueVote, _clientDialogueVote))
+        var clientSpectating = _clientSpectatorBundleKey != 0 &&
+            _clientSpectatorBundleKey == _dialogueVoteBundleKey && !LabMode.IsMutant("dialogue-spectator");
+        if (!DialogueVotesMatch(_hostDialogueVote, clientSpectating ? _hostDialogueVote : _clientDialogueVote))
             return;
         var bundleKey = _dialogueVoteBundleKey;
         var voteScope = _dialogueVoteScope;
@@ -2109,7 +2135,7 @@ internal sealed class ManagerEventReplicator
     internal void Clear(bool preserveHostSessions = false)
     {
         if (!preserveHostSessions && _clientDialogueBundleKey != 0 &&
-            DialogueManager.Instance?.IsPlaying == true)
+            (DialogueManager.hasInstance ? DialogueManager.Instance : null)?.IsPlaying == true)
         {
             var previousApplying = _applying;
             var previousDialogueAuthority = _applyingDialogueAuthority;
@@ -2225,6 +2251,7 @@ internal sealed class ManagerEventReplicator
         _hostClockOffset = 0;
         _wasConnected = false;
         _storySnapshotPublished = false;
+        _storySnapshotsSent = 0;
         _activeSessionSnapshotPublished = false;
         if (!preserveHostSessions)
         {
@@ -2280,7 +2307,7 @@ internal sealed class ManagerEventReplicator
         _storySnapshotPublished = false;
         _nextStoryScan = 0f;
         _nextStorySafetyKeyframe = _wasConnected
-            ? Time.realtimeSinceStartup + 5f
+            ? Time.realtimeSinceStartup + 60f
             : 0f;
     }
 
@@ -2327,6 +2354,7 @@ internal sealed class ManagerEventReplicator
         }
         ResetDialogueVotes();
         ResetDialogueCommit();
+        _clientSpectatorBundleKey = 0;
         _remoteSushiPlate = null;
         _clientRemoteSushiPlate = false;
         _hostSushiOpened = false;
@@ -2406,7 +2434,9 @@ internal sealed class ManagerEventReplicator
             IsGlobal(domain) && !sceneLocal ? 0 : _sceneId,
             CurrentTick(),
             (byte)domain, (byte)action, value, context, invocation,
-            SceneEpoch: sceneLocal ? session?.LocalSceneEpoch ?? 0 : 0);
+            // Scene-bound events carry the epoch they were published in, so one that waits in the queue across a
+            // scene change can't be applied to a later visit of the same scene.
+            SceneEpoch: IsGlobal(domain) && !sceneLocal ? 0 : session?.LocalSceneEpoch ?? 0);
         TraceManagerEvent("publish", state, lane, revision, _outboundEvents.Count);
         TryQueueOutbound(session, state);
         FlushOutbound(session);
@@ -2536,7 +2566,14 @@ internal sealed class ManagerEventReplicator
                 $"hostBundle={_hostDialogueBundleKey:X8}; context={state.Context}");
             return;
         }
-        var manager = DialogueManager.Instance;
+        var manager = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
+        if (clientVote == DialogueVoteSpectator)
+        {
+            _clientSpectatorBundleKey = state.Value;
+            _log?.LogInfo($"Client dialogue spectator: bundle={state.Value:X8}; host votes alone");
+            TryCommitDialogueVotes(session, manager);
+            return;
+        }
         if (!CanApplyDialogueVoteScope(manager, state.Value, voteScope) ||
             IsCommittedDialogueScope(
                 state.Value, voteScope,
@@ -2564,6 +2601,12 @@ internal sealed class ManagerEventReplicator
             var revision = GetRevision(_clientManagerRevisions, pair.Key);
             ApplyPendingLane(pair.Value, ref revision, state =>
             {
+                // Lab mutants: the client stops applying one domain, so the day/story checks must fail.
+                if (LabMode.IsMutant("day") && (ManagerDomain)state.Domain == ManagerDomain.Day ||
+                    LabMode.IsMutant("story") && (ManagerDomain)state.Domain == ManagerDomain.Story ||
+                    LabMode.IsMutant("sushi") && (ManagerDomain)state.Domain is ManagerDomain.MainSushi or
+                        ManagerDomain.SushiMenu or ManagerDomain.SushiTable)
+                    return false;
                 var applied = false;
                 if (state.SceneId == 0)
                     applied = state.SceneEpoch == 0 ? Apply(state) : true;
@@ -2827,7 +2870,7 @@ internal sealed class ManagerEventReplicator
         int index,
         ManagerInvocationDescriptor? invocation)
     {
-        var manager = DialogueManager.Instance;
+        var manager = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
         switch (action)
         {
             case ManagerAction.ManagementPanelState:
@@ -2900,10 +2943,32 @@ internal sealed class ManagerEventReplicator
                     _log.LogInfo(
                         $"Dialogue presentation spectator fallback: bundle={bundleKey:X8}; " +
                         "unsupported or unavailable invocation");
+                    SendDialogueSpectator(bundleKey);
                     return true;
                 }
                 _clientDialogueSpectating = false;
-                ReplayDialogueStart(manager, _pendingClientDialogueStart);
+                var failure = string.Empty;
+                try
+                {
+                    ReplayDialogueStart(manager, _pendingClientDialogueStart);
+                }
+                catch (Exception exception)
+                {
+                    failure = exception.Message;
+                }
+                // Seen on build 26209260: StartDialogueV2 throws a native NullReferenceException for the tutorial
+                // bundles on the client, and Il2CppInterop swallows it inside the patched method. Check that the
+                // dialogue really started; if not, spectate instead of blocking the dialogue lane.
+                if (failure.Length == 0 && (!manager.IsPlaying || ContentKey(manager.CurrentBundleID) != bundleKey))
+                    failure = $"not playing after start (bundle={manager.CurrentBundleID ?? "none"})";
+                if (failure.Length > 0)
+                {
+                    _clientDialogueSpectating = true;
+                    _log.LogWarning(
+                        $"Dialogue presentation spectator fallback: bundle={bundleKey:X8}; native start failed: {failure}");
+                    SendDialogueSpectator(bundleKey);
+                    return true;
+                }
                 FocusSharedDialogueInput(manager, bundleKey);
                 _log?.LogInfo($"Dialogue client replay started: bundle={bundleKey:X8}");
                 return true;
@@ -2942,7 +3007,7 @@ internal sealed class ManagerEventReplicator
                     manager.TotalFinishDialogue();
                 if (!CompleteDialogueCallback(bundleKey, index != 0))
                 {
-                    var ui = GlobalUI.Instance;
+                    var ui = (GlobalUI.hasInstance ? GlobalUI.Instance : null);
                     var wasHudOn = ui?.CurMainCanvas?.IsHudOn == true;
                     ui?.ShowHUD(HUDLockType.Dialogue);
                     _log?.LogInfo(
@@ -3110,7 +3175,7 @@ internal sealed class ManagerEventReplicator
         int nodeId,
         ManagerInvocationDescriptor? invocation)
     {
-        var manager = ScenarioManager.Instance;
+        var manager = (ScenarioManager.hasInstance ? ScenarioManager.Instance : null);
         switch (action)
         {
             case ManagerAction.ScenarioStarted:
@@ -3206,6 +3271,15 @@ internal sealed class ManagerEventReplicator
                 pending.BundleId, null, pending.UseButton, pending.ShowCurtain, pending.IgnorePlaying);
     }
 
+    // The game's own callers always pass a finish callback; on this build StartDialogueV2 throws a native
+    // NullReferenceException for a null one, which blocked the client's dialogue lane (host stuck at 1/2 votes).
+    private static Il2CppSystem.Action<bool> _noFinish;
+
+    private static Il2CppSystem.Action<bool> NoFinish() =>
+        _noFinish ??= LabMode.IsMutant("dialogue-null")
+            ? null
+            : DelegateSupport.ConvertDelegate<Il2CppSystem.Action<bool>>((Action<bool>)(_ => { }));
+
     private static void ReplayDialogueStart(
         DialogueManager manager, PendingDialogueStart pending)
     {
@@ -3213,11 +3287,11 @@ internal sealed class ManagerEventReplicator
         {
             case DialogueStartKind.Arguments:
                 manager.StartDialogueV2(
-                    pending.BundleId, pending.Arguments, null, pending.UseButton, pending.ShowCurtain);
+                    pending.BundleId, pending.Arguments, NoFinish(), pending.UseButton, pending.ShowCurtain);
                 break;
             case DialogueStartKind.Small:
                 manager.StartSmallDialogue(
-                    pending.BundleId, null, pending.UseButton, pending.ShowCurtain);
+                    pending.BundleId, NoFinish(), pending.UseButton, pending.ShowCurtain);
                 break;
             case DialogueStartKind.VisualNovel:
                 manager.StartVisualNovel(
@@ -3225,7 +3299,7 @@ internal sealed class ManagerEventReplicator
                 break;
             default:
                 manager.StartDialogueV2(
-                    pending.BundleId, null, pending.UseButton, pending.ShowCurtain);
+                    pending.BundleId, NoFinish(), pending.UseButton, pending.ShowCurtain);
                 break;
         }
     }
@@ -3465,7 +3539,7 @@ internal sealed class ManagerEventReplicator
             {
                 var customer = SushiBar.Customer.SushiBarCustomerManager.Instance?
                     .GetVisitCustomer(drinkSeat, drinkPlace);
-                var staff = SushiBarManager.Instance?.dave;
+                var staff = (SushiBarManager.hasInstance ? SushiBarManager.Instance : null)?.dave;
                 if (customer?.IsDrinkOrderWaiting == true && staff != null)
                 {
                     try
@@ -3522,7 +3596,7 @@ internal sealed class ManagerEventReplicator
                 var customer = SushiBar.Customer.SushiBarCustomerManager.Instance?
                     .GetVisitCustomer(table, place);
                 var expected = _remoteSushiPlate.ReciveCustomer;
-                var staff = SushiBarManager.Instance?.dave;
+                var staff = (SushiBarManager.hasInstance ? SushiBarManager.Instance : null)?.dave;
                 if (customer != null && customer.CanServed() &&
                     staff != null &&
                     (expected == null || expected.GetInstanceID() == customer.GetInstanceID()))
@@ -3565,7 +3639,7 @@ internal sealed class ManagerEventReplicator
 
     private bool ApplySushiFoodResult(ManagerAction action, int value, int context)
     {
-        var dave = SushiBarManager.Instance?.dave;
+        var dave = (SushiBarManager.hasInstance ? SushiBarManager.Instance : null)?.dave;
         if (dave == null)
             return false;
         if (action == ManagerAction.SushiPickupResult)
@@ -3621,7 +3695,7 @@ internal sealed class ManagerEventReplicator
             .GetVisitCustomer(seat, place);
         if (customer == null)
             return false;
-        var staff = SushiBarManager.Instance?.dave;
+        var staff = (SushiBarManager.hasInstance ? SushiBarManager.Instance : null)?.dave;
         if (staff != null && customer.IsDrinkOrderWaiting)
         {
             try
@@ -3887,7 +3961,7 @@ internal sealed class ManagerEventReplicator
 
     private static bool TryFindTablePlace(SushiBarTable table, out SushiBar.Place place)
     {
-        var manager = SushibarTableManager.Instance;
+        var manager = (SushibarTableManager.hasInstance ? SushibarTableManager.Instance : null);
         if (manager != null)
             for (var value = (int)SushiBar.Place.Main; value < (int)SushiBar.Place.Max; value++)
                 if (manager.GetTable(table.tableNumber, (SushiBar.Place)value) == table)
@@ -4154,7 +4228,7 @@ internal sealed class ManagerEventReplicator
     {
         var place = (SushiBar.Place)((uint)context >> 16);
         var tableNumber = context & 0xffff;
-        var table = SushibarTableManager.Instance?.GetTable(tableNumber, place);
+        var table = (SushibarTableManager.hasInstance ? SushibarTableManager.Instance : null)?.GetTable(tableNumber, place);
         if (table == null)
             return false;
         table.SetTrash(dirty);
@@ -4598,7 +4672,7 @@ internal sealed class ManagerEventReplicator
                     return false;
                 var type = (CommonRewardType)(actionValue - RewardActionBase);
                 var reward = Reward.CreateInstance(type, value, count, showType);
-                if (reward == null || RewardManager.Instance == null)
+                if (reward == null || (RewardManager.hasInstance ? RewardManager.Instance : null) == null)
                     return false;
                 RewardManager.Instance.Reward(reward);
                 _log.LogInfo($"Shared reward applied: type={type}; value={value}; count={count}");
@@ -4628,7 +4702,7 @@ internal sealed class ManagerEventReplicator
             }
             if (action != ManagerAction.Unlock || context is < 0 or > 3)
                 return false;
-            var unlockManager = ContentsUnlockManager.Instance;
+            var unlockManager = (ContentsUnlockManager.hasInstance ? ContentsUnlockManager.Instance : null);
             var contents = (ContentsList)value;
             var data = unlockManager?.GetUnlockData(contents);
             var created = false;
@@ -4676,7 +4750,7 @@ internal sealed class ManagerEventReplicator
         for (var value = (int)GoodsType.gold; value <= (int)GoodsType.fakePoint; value++)
             PublishWalletIfChanged(session, (GoodsType)value);
 
-        var unlocks = ContentsUnlockManager.Instance?.m_UnlockDatas;
+        var unlocks = (ContentsUnlockManager.hasInstance ? ContentsUnlockManager.Instance : null)?.m_UnlockDatas;
         if (unlocks != null)
         {
             foreach (var pair in unlocks)
@@ -5076,7 +5150,7 @@ internal sealed class ManagerEventReplicator
     {
         if (session?.Connected != true)
             return;
-        var manager = DialogueManager.Instance;
+        var manager = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
         var bundleKey = role == SessionRole.Host
             ? _hostDialogueBundleKey
             : _clientDialogueBundleKey;
@@ -5198,7 +5272,7 @@ internal sealed class ManagerEventReplicator
     {
         var handler = _pendingClientTutorialGuide;
         if (handler == null || _clientDialogueBundleKey != 0 ||
-            DialogueManager.Instance?.IsPlaying == true)
+            (DialogueManager.hasInstance ? DialogueManager.Instance : null)?.IsPlaying == true)
             return;
         var expectsText = !string.IsNullOrEmpty(handler.guideTextID);
         var expectsPointer = handler.guideArrowTarget != null;
@@ -5536,7 +5610,7 @@ internal sealed class ManagerEventReplicator
 
     internal void UpdateDialogueVoteLabels()
     {
-        var manager = DialogueManager.Instance;
+        var manager = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
         if (manager?.IsPlaying != true || IsLocalDialogueBundle(manager.CurrentBundleID))
         {
             RestoreDialogueVoteLabels();
@@ -5613,7 +5687,7 @@ internal sealed class ManagerEventReplicator
     {
         if (_dialogueVoteLabel != null)
             _dialogueVoteLabel.gameObject.SetActive(false);
-        var manager = DialogueManager.Instance;
+        var manager = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
         RestoreChoiceVoteLabels(manager?.imageChoiceDialoguePanel);
         RestoreChoiceVoteLabels(manager?.deliveryDialoguePanel);
         RestoreChoiceVoteLabels(manager?.requestMissionDialoguePanel);
@@ -5686,7 +5760,7 @@ internal sealed class ManagerEventReplicator
         if ((ManagerAction)state.Action == ManagerAction.PhoneAnswered)
             return IsPhoneIntentValid(
                 ManagerAction.PhoneAnswered, state.Value, _hostPhoneTid, _hostPhoneTid != 0);
-        var manager = DialogueManager.Instance;
+        var manager = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
         return manager != null && state.Value == _hostDialogueBundleKey &&
             state.Context == _hostDialogueIndex && IsDialogueIntentValid(
             (ManagerAction)state.Action,
@@ -6165,8 +6239,8 @@ internal sealed class ManagerEventReplicator
     {
         try
         {
-            var dialogue = DialogueManager.Instance;
-            var scenario = ScenarioManager.Instance;
+            var dialogue = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
+            var scenario = (ScenarioManager.hasInstance ? ScenarioManager.Instance : null);
             var tutorial = TutorialManager.Instance;
             return
                 $"dialoguePlaying={dialogue?.IsPlaying == true}; " +
@@ -6211,7 +6285,7 @@ internal static class ManagerEventPatchHelper
     internal static bool Intercept(ManagerDomain domain, ManagerAction action, int value = 0)
     {
         var behaviour = ProbeBehaviour.Instance;
-        var dialogue = domain == ManagerDomain.Dialogue ? DialogueManager.Instance : null;
+        var dialogue = domain == ManagerDomain.Dialogue ? (DialogueManager.hasInstance ? DialogueManager.Instance : null) : null;
         var context = dialogue?.m_CurrentDialogueIndex ?? 0;
         if (dialogue != null)
             value = string.IsNullOrEmpty(dialogue.CurrentBundleID)
@@ -6226,7 +6300,7 @@ internal static class ManagerEventPatchHelper
         out bool suppressNested)
     {
         var behaviour = ProbeBehaviour.Instance;
-        var dialogue = DialogueManager.Instance;
+        var dialogue = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
         var value = string.IsNullOrEmpty(dialogue?.CurrentBundleID)
             ? 0
             : unchecked((int)Protocol.SceneId(dialogue.CurrentBundleID));
@@ -6244,7 +6318,7 @@ internal static class ManagerEventPatchHelper
     internal static bool BeginChoice(int choiceIndex, out bool suppressNested)
     {
         var behaviour = ProbeBehaviour.Instance;
-        var dialogue = DialogueManager.Instance;
+        var dialogue = (DialogueManager.hasInstance ? DialogueManager.Instance : null);
         if (behaviour != null && dialogue != null && choiceIndex >= 0)
         {
             var bundleKey = string.IsNullOrEmpty(dialogue.CurrentBundleID)
@@ -6267,7 +6341,7 @@ internal static class ManagerEventPatchHelper
         if (table == null)
             return 0;
         for (var place = 0; place < (int)SushiBar.Place.Max; place++)
-            if (SushibarTableManager.Instance?.GetTable(
+            if ((SushibarTableManager.hasInstance ? SushibarTableManager.Instance : null)?.GetTable(
                     table.tableNumber, (SushiBar.Place)place) == table)
                 return place << 16 | table.tableNumber & 0xffff;
         return table.tableNumber & 0xffff;

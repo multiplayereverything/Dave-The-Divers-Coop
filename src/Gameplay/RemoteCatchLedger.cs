@@ -1137,8 +1137,8 @@ internal sealed class RemoteCatchLedger
 
     private void UpdateAcceptedMissions(IEnumerable<LootEntry> entries)
     {
-        var manager = MissionManager.Instance;
-        var data = DataManager.Instance;
+        var manager = (MissionManager.hasInstance ? MissionManager.Instance : null);
+        var data = (DataManager.hasInstance ? DataManager.Instance : null);
         if (manager == null || data == null)
             return;
         foreach (var entry in entries)

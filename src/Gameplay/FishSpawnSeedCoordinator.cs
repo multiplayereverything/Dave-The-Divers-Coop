@@ -165,7 +165,7 @@ internal static class FishSpawnSeedCoordinator
             return default;
 
         var uid = string.IsNullOrWhiteSpace(nativeUid)
-            ? BuildFallbackAllocatorUid(sceneId, source.GetType().FullName ?? source.GetType().Name,
+            ? BuildFallbackAllocatorUid(sceneId, Il2CppNames.FullName(source) ?? source.GetType().Name,
                 HierarchyPath(source.transform))
             : nativeUid;
         var scope = BuildScopedUid(subsystem, uid);
@@ -198,7 +198,7 @@ internal static class FishSpawnSeedCoordinator
         }
         var path = HierarchyPath(allocator.transform);
         return BuildFallbackAllocatorUid(
-            sceneId, allocator.GetType().FullName ?? nameof(FishAllocator), path);
+            sceneId, Il2CppNames.FullName(allocator) ?? nameof(FishAllocator), path);
     }
 
     private static string BuildFallbackAllocatorUid(uint sceneId, string componentType, string path) =>

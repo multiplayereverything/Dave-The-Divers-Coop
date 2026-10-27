@@ -23,6 +23,19 @@ internal static class LobbyInput
             error = "Choose Host or Join";
             return false;
         }
+        // Steam: "steam" to host, "steam:<lobby or SteamID>" to join. The port is not used.
+        if (SteamP2P.TryParseAddress(normalizedAddress, out var steamTarget))
+        {
+            if (!int.TryParse(portText, out port) || port is < 1024 or > 65535)
+                port = 27777;
+            if (role == SessionRole.Client && steamTarget == 0)
+            {
+                error = "Pick a friend's game to join";
+                return false;
+            }
+            normalizedAddress = role == SessionRole.Host ? SteamP2P.AddressPrefix : SteamP2P.AddressOf(steamTarget);
+            return true;
+        }
         if (!int.TryParse(portText, out port) || port is < 1024 or > 65535)
         {
             error = "Port must be 1024-65535";

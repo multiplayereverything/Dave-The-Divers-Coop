@@ -132,6 +132,8 @@ internal sealed class TravelCoordinator
         }
         else if (role == SessionRole.Client)
         {
+            if (LabMode.IsMutant("travel"))
+                return false;
             _clientReady = true;
             _clientAction ??= localAction;
             _localRevision = NextRevision(_localRevision);

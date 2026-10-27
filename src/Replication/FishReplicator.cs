@@ -234,6 +234,17 @@ internal sealed class FishReplicator
     private readonly ManualLogSource _log;
     private readonly SessionTrace _trace;
     private readonly RemoteCatchLedger _ledger;
+    // Lab tour: the fish this side tracks by shared id (host: authoritative fish; client: bound proxies).
+    internal IEnumerable<KeyValuePair<int, FishAISystem>> LabFish(SessionRole role)
+    {
+        if (role == SessionRole.Host)
+            return _hostFishById;
+        var list = new List<KeyValuePair<int, FishAISystem>>();
+        foreach (var pair in _clientIdsByFish)
+            list.Add(new KeyValuePair<int, FishAISystem>(pair.Value, pair.Key));
+        return list;
+    }
+
     private readonly Dictionary<int, FishAISystem> _hostFishById = new();
     private readonly Dictionary<FishAISystem, int> _hostIdsByFish = new();
     private readonly Dictionary<int, HostFish> _hostInfoById = new();
@@ -1428,7 +1439,8 @@ internal sealed class FishReplicator
         {
         }
         while (session.TryTakeFishActionRequest(out var actionRequest))
-            ApplyHostAction(session, sceneId, now, remotePlayerTransform, actionRequest);
+            if (!LabMode.IsMutant("fish-request"))
+                ApplyHostAction(session, sceneId, now, remotePlayerTransform, actionRequest);
         while (session.TryTakeFishHookPose(out var pose))
             ApplyHostHookPose(session, sceneId, now, pose);
         while (session.TryTakeFishLootComplete(out var complete))

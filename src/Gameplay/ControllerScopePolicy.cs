@@ -29,8 +29,8 @@ internal static class ControllerScopePolicy
         // Fallback scan runs only while no supported player controller is bound.
         foreach (var candidate in UnityEngine.Object.FindObjectsOfType<Component>())
             if (candidate != null && candidate.gameObject?.activeInHierarchy == true &&
-                (IsUnsupported(candidate.GetType().Name) ||
-                 IsUnsupported(candidate.GetType().FullName)))
+                (IsUnsupported(Il2CppNames.Name(candidate)) ||
+                 IsUnsupported(Il2CppNames.FullName(candidate))))
                 return candidate;
         return null;
     }

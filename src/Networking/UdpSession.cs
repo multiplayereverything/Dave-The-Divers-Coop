@@ -16,6 +16,29 @@ internal enum SessionRole
     Client
 }
 
+// Where a datagram came from or goes to: an IPv4 endpoint (LAN) or a SteamID (Steam P2P).
+internal sealed class PeerEndpoint : IEquatable<PeerEndpoint>
+{
+    internal readonly IPEndPoint Ip;
+    internal readonly ulong SteamId;
+
+    private PeerEndpoint(IPEndPoint ip, ulong steamId)
+    {
+        Ip = ip;
+        SteamId = steamId;
+    }
+
+    internal static PeerEndpoint Of(IPEndPoint ip) => new(ip, 0);
+    internal static PeerEndpoint Steam(ulong id) => new(null, id);
+    public bool Equals(PeerEndpoint other) =>
+        other != null && SteamId == other.SteamId && (Ip == null ? other.Ip == null : Ip.Equals(other.Ip));
+    public override bool Equals(object obj) => Equals(obj as PeerEndpoint);
+    public override int GetHashCode() => Ip?.GetHashCode() ?? SteamId.GetHashCode();
+    public override string ToString() => Ip != null ? Ip.ToString() : $"steam:{SteamId}";
+}
+
+internal readonly record struct Datagram(byte[] Buffer, PeerEndpoint RemoteEndPoint);
+
 internal readonly record struct DiverCommitDiagnostics(
     uint HostRuntimeRevision,
     uint ClientRuntimeRevision,
@@ -32,8 +55,11 @@ internal sealed class UdpSession : IDisposable
 {
     private const int MaxIncomingDatagrams = 1024;
     private const int MaxDatagramsPerUpdate = 128;
-    private const int MaxReliableAttempts = 12;
-    private const float ReliableExpirySeconds = 15f;
+    // A peer's game can stall for many seconds (scene loads, saves, a busy PC); the lab saw an 18 s stall on the
+    // boat. With a 5 s timeout and 15 s reliable expiry that ended the session and sent the client to the title.
+    private static int MaxReliableAttempts => LabMode.IsMutant("short-timeout") ? 12 : 40;
+    private static float ReliableExpirySeconds => LabMode.IsMutant("short-timeout") ? 15f : 30f;
+    private static float PeerTimeoutSeconds => LabMode.IsMutant("short-timeout") ? 5f : 20f;
     private const int MaxReliableBacklog = 2048;
     private const int ReliableReceiveWindowSize = 1024;
     private const int ReservedReliableControlSlots = 16;
@@ -81,6 +107,13 @@ internal sealed class UdpSession : IDisposable
     private const int MaxFishHookPoses = 128;
     private const int PacketTypeCounterSlots = byte.MaxValue + 1;
 
+    private enum ReliableVerdict
+    {
+        New,
+        Duplicate,
+        TooOld
+    }
+
     private sealed class ReliableReceiveWindow
     {
         private const int Size = ReliableReceiveWindowSize;
@@ -88,7 +121,7 @@ internal sealed class UdpSession : IDisposable
         private uint _newest;
         private bool _hasNewest;
 
-        internal bool Accept(uint sequence)
+        internal ReliableVerdict Accept(uint sequence)
         {
             if (!_hasNewest)
             {
@@ -107,18 +140,22 @@ internal sealed class UdpSession : IDisposable
                             Clear(_newest + (uint)offset);
                     _newest = sequence;
                 }
-                else if (delta == 0 || unchecked(_newest - sequence) >= Size)
+                else if (delta == 0)
                 {
-                    return false;
+                    return ReliableVerdict.Duplicate;
+                }
+                else if (unchecked(_newest - sequence) >= Size)
+                {
+                    return ReliableVerdict.TooOld;
                 }
             }
 
             var index = (int)(sequence & (Size - 1));
             var mask = 1UL << (index & 63);
             if ((_seen[index >> 6] & mask) != 0)
-                return false;
+                return ReliableVerdict.Duplicate;
             _seen[index >> 6] |= mask;
-            return true;
+            return ReliableVerdict.New;
         }
 
         internal void Clear()
@@ -150,7 +187,7 @@ internal sealed class UdpSession : IDisposable
     }
 
     private readonly ManualLogSource _log;
-    private readonly ConcurrentQueue<UdpReceiveResult> _incoming = new();
+    private readonly ConcurrentQueue<Datagram> _incoming = new();
     private readonly Queue<int> _fishSnapshotOrder = new();
     private readonly Dictionary<int, FishSnapshot> _fishSnapshots = new();
     private readonly ConcurrentQueue<FishDamageRequest> _fishDamageRequests = new();
@@ -248,7 +285,13 @@ internal sealed class UdpSession : IDisposable
     private readonly Queue<QueuedReliable> _reliableBulkBacklog = new();
     private readonly ReliableReceiveWindow _receivedReliable = new();
     private UdpClient _udp;
-    private IPEndPoint _remote;
+    private PeerEndpoint _remote;
+    // Steam transport: friends-only lobby (host) or the host's lobby (client), polled each Update.
+    private bool _steam;
+    private ulong _steamLobby;
+    private ulong _steamLobbyCall;
+    private bool _steamLobbyCreate;
+    private float _nextSteamAccept;
     private SessionRole _role;
     private string _localName = "Diver";
     private string _remoteName = "Diver";
@@ -302,18 +345,29 @@ internal sealed class UdpSession : IDisposable
 
     internal UdpSession(ManualLogSource log) => _log = log;
 
+    private static bool IsNew(ReliableReceiveWindow window, uint sequence) =>
+        window.Accept(sequence) == ReliableVerdict.New;
+
     internal static void SelfTest()
     {
         var window = new ReliableReceiveWindow();
-        if (!window.Accept(uint.MaxValue - 1) || !window.Accept(0) ||
-            !window.Accept(uint.MaxValue) || window.Accept(uint.MaxValue) ||
-            !window.Accept(2) || !window.Accept(1))
+        if (!IsNew(window, uint.MaxValue - 1) || !IsNew(window, 0) ||
+            !IsNew(window, uint.MaxValue) || IsNew(window, uint.MaxValue) ||
+            !IsNew(window, 2) || !IsNew(window, 1))
             throw new InvalidOperationException("Reliable receive wrap/reorder self-test failed");
 
         window = new ReliableReceiveWindow();
-        if (!window.Accept(1) || !window.Accept(1025) || window.Accept(1) ||
-            !window.Accept(2) || window.Accept(2) || window.Accept(1025))
+        if (!IsNew(window, 1) || !IsNew(window, 1025) || IsNew(window, 1) ||
+            !IsNew(window, 2) || IsNew(window, 2) || IsNew(window, 1025))
             throw new InvalidOperationException("Reliable receive replay self-test failed");
+        window = new ReliableReceiveWindow();
+        if (window.Accept(5) != ReliableVerdict.New || window.Accept(1100) != ReliableVerdict.New ||
+            window.Accept(5) != ReliableVerdict.TooOld || window.Accept(1100) != ReliableVerdict.Duplicate)
+            throw new InvalidOperationException("Reliable receive too-old self-test failed");
+        if (!PeerEndpoint.Steam(7).Equals(PeerEndpoint.Steam(7)) || PeerEndpoint.Steam(7).Equals(PeerEndpoint.Steam(8)) ||
+            !PeerEndpoint.Of(new IPEndPoint(IPAddress.Loopback, 5)).Equals(PeerEndpoint.Of(new IPEndPoint(IPAddress.Loopback, 5))) ||
+            PeerEndpoint.Of(new IPEndPoint(IPAddress.Loopback, 5)).Equals(PeerEndpoint.Steam(5)))
+            throw new InvalidOperationException("Peer endpoint self-test failed");
 
         if (!IsFishDirectionAllowed(SessionRole.Client, PacketType.FishLifecycle) ||
             !IsFishDirectionAllowed(SessionRole.Host, PacketType.FishActionRequest) ||
@@ -1476,7 +1530,9 @@ internal sealed class UdpSession : IDisposable
     }
 
     internal bool Connected => _connected;
-    internal bool IsRunning => _udp != null && !_receiveFailed;
+    internal bool IsRunning => (_udp != null || _steam) && !_receiveFailed;
+    internal ulong SteamLobby => _steamLobby;
+    internal bool IsSteam => _steam;
     internal string RemoteName => _remoteName;
     internal string ConnectionFailure => _handshakeRejectReason;
     internal uint LocalSceneEpoch => _localSceneEpoch;
@@ -2243,6 +2299,17 @@ internal sealed class UdpSession : IDisposable
             SendReliable(Protocol.EncodeAdditiveSceneLoad(++_sequence, state));
     }
 
+    private string _diveLayout;
+
+    internal bool HasDiveLayout => _diveLayout != null;
+
+    internal bool TryTakeDiveLayout(out string layout)
+    {
+        layout = _diveLayout;
+        _diveLayout = null;
+        return layout != null;
+    }
+
     internal bool TryTakeAdditiveSceneLoad(out AdditiveSceneLoad state) =>
         _additiveSceneLoads.TryDequeue(out state);
 
@@ -2552,6 +2619,13 @@ internal sealed class UdpSession : IDisposable
             {
                 SceneEpoch = _role == SessionRole.Host ? _localSceneEpoch : _remoteSceneEpoch
             };
+        // A host event from a scene the host has left can never match again. It used to block the whole manager
+        // lane (story, day, dialogue behind it) until the 256-event overflow reset the peer. Send it as it is: the
+        // client counts an event for another scene/epoch as applied and moves on.
+        if (_role == SessionRole.Host && !IsSceneBoundManagementPanelEvent(state) &&
+            (state.SceneId != _localSceneId || state.SceneEpoch != _localSceneEpoch) &&
+            !LabMode.IsMutant("manager-stale"))
+            return SendReliable(Protocol.EncodeManagerEvent(++_sequence, state));
         return (IsSceneBoundManagementPanelEvent(state) ||
                 (_role == SessionRole.Host
                     ? MatchesLocalWorld(state.SceneId, state.SceneEpoch)
@@ -2647,6 +2721,12 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (SteamP2P.IsSteamAddress(address))
+        {
+            StartSteam(role, address);
+            return;
+        }
+
         try
         {
             if (role == SessionRole.Host)
@@ -2660,7 +2740,7 @@ internal sealed class UdpSession : IDisposable
                     throw new ArgumentException($"Invalid IPv4 address: {address}");
 
                 _udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
-                _remote = new IPEndPoint(ip, port);
+                _remote = PeerEndpoint.Of(new IPEndPoint(ip, port));
                 _log.LogInfo($"Network: connecting to {_remote}");
             }
 
@@ -2686,8 +2766,10 @@ internal sealed class UdpSession : IDisposable
             _log.LogWarning("Network: session stopped after a receive failure");
             return;
         }
-        if (_udp == null)
+        if (_udp == null && !_steam)
             return;
+        if (_steam)
+            PumpSteam(now);
 
         var processed = 0;
         var processLimit = DatagramsToProcess(Volatile.Read(ref _incomingCount));
@@ -2725,7 +2807,7 @@ internal sealed class UdpSession : IDisposable
             _receivedPackets = 0;
         }
 
-        if (_connected && now - _lastReceive > 5f)
+        if (_connected && now - _lastReceive > PeerTimeoutSeconds)
         {
             SignalPeerLoss("host timed out");
             ResetPeerState();
@@ -2765,7 +2847,7 @@ internal sealed class UdpSession : IDisposable
                         Interlocked.Increment(ref _incomingDropped);
                         continue;
                     }
-                    _incoming.Enqueue(received);
+                    _incoming.Enqueue(new Datagram(received.Buffer, PeerEndpoint.Of(received.RemoteEndPoint)));
                 }
                 catch (SocketException exception) when (
                     exception.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionRefused)
@@ -2791,7 +2873,7 @@ internal sealed class UdpSession : IDisposable
         }
     }
 
-    private void Handle(UdpReceiveResult received, float now)
+    private void Handle(Datagram received, float now)
     {
         if (_role == SessionRole.Client && !_connected && _remote != null &&
             received.RemoteEndPoint.Equals(_remote) &&
@@ -2816,6 +2898,8 @@ internal sealed class UdpSession : IDisposable
 
         if (_role == SessionRole.Host && _remote == null)
         {
+            if (LabMode.IsMutant("connect"))
+                return;
             if (type != PacketType.Hello || sessionId == 0 ||
                 !Protocol.TryDecodeIdentity(
                     received.Buffer, PacketType.Hello, out _, out var remoteBuildId, out var remoteName))
@@ -2836,7 +2920,13 @@ internal sealed class UdpSession : IDisposable
         }
 
         if (_remote == null || !received.RemoteEndPoint.Equals(_remote))
+        {
+            // Only one diver can join; tell a second client instead of letting it retry Hello forever.
+            if (_role == SessionRole.Host && _remote != null && type == PacketType.Hello && sessionId != 0)
+                SendHandshakeReject(
+                    received.RemoteEndPoint, sessionId, received.Buffer[4], HandshakeRejectReason.RoomFull);
             return;
+        }
         if (sessionId == 0 || sessionId != _sessionId)
             return;
         TrackPacketReceive(type);
@@ -2996,10 +3086,13 @@ internal sealed class UdpSession : IDisposable
                 Protocol.TryDecodeAdditiveSceneLoad(received.Buffer, out _, out var state))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence) &&
-                    HasDecodedQueueCapacity(
-                        _additiveSceneLoads.Count, MaxPendingAdditiveSceneLoads))
-                    _additiveSceneLoads.Enqueue(state);
+                if (AcceptReliable(sequence))
+                {
+                    if (DiveLayoutSync.IsLayoutMessage(state.SceneName))
+                        _diveLayout = state.SceneName;
+                    else if (HasDecodedQueueCapacity(_additiveSceneLoads.Count, MaxPendingAdditiveSceneLoads))
+                        _additiveSceneLoads.Enqueue(state);
+                }
             }
             return;
         }
@@ -3613,18 +3706,18 @@ internal sealed class UdpSession : IDisposable
     }
 
     private void SendHandshakeReject(
-        IPEndPoint endpoint,
+        PeerEndpoint endpoint,
         ulong sessionId,
         byte peerVersion,
         HandshakeRejectReason reason)
     {
-        if (_udp == null || sessionId == 0)
+        if (_udp == null && !_steam || sessionId == 0)
             return;
         try
         {
             var packet = Protocol.EncodeHandshakeReject(++_sequence, reason, peerVersion);
             Protocol.SetSessionId(packet, sessionId);
-            _udp.Send(packet, packet.Length, endpoint);
+            SendRaw(packet, endpoint);
             _sentBytes += packet.Length;
             _sentPackets++;
         }
@@ -3839,12 +3932,12 @@ internal sealed class UdpSession : IDisposable
 
     private void Send(byte[] packet)
     {
-        if (_udp == null || _remote == null)
+        if (_udp == null && !_steam || _remote == null)
             return;
         try
         {
             Protocol.SetSessionId(packet, _sessionId);
-            _udp.Send(packet, packet.Length, _remote);
+            SendRaw(packet, _remote);
             _sentBytes += packet.Length;
             _sentPackets++;
         }
@@ -3962,8 +4055,13 @@ internal sealed class UdpSession : IDisposable
 
     private bool AcceptReliable(uint sequence)
     {
-        Send(Protocol.Encode(PacketType.Ack, sequence));
-        return _receivedReliable.Accept(sequence);
+        // A sequence that fell out of the receive window can't be told apart from a duplicate, so it is not acked:
+        // the sender keeps retrying and, if it never fits, fails delivery loudly (peer reset and recovery) instead of
+        // treating a dropped manifest or grant as delivered.
+        var verdict = _receivedReliable.Accept(sequence);
+        if (verdict != ReliableVerdict.TooOld)
+            Send(Protocol.Encode(PacketType.Ack, sequence));
+        return verdict == ReliableVerdict.New;
     }
 
     private static bool IsNewer(uint sequence, uint previous) =>
@@ -4497,6 +4595,7 @@ internal sealed class UdpSession : IDisposable
         {
             HandshakeRejectReason.IncompatibleProtocol => "Incompatible multiplayer protocol",
             HandshakeRejectReason.IncompatibleBuild => "Incompatible game or mod build",
+            HandshakeRejectReason.RoomFull => "Room is full",
             _ => "Connection rejected"
         };
         ResetPeerState();
@@ -4685,13 +4784,138 @@ internal sealed class UdpSession : IDisposable
         }
     }
 
+    private void StartSteam(SessionRole role, string address)
+    {
+        if (!SteamP2P.Ready)
+        {
+            _log.LogError($"Network start failed: {SteamP2P.Problem}");
+            return;
+        }
+        if (!SteamP2P.TryParseAddress(address, out var target))
+        {
+            _log.LogError($"Network start failed: invalid Steam address {address}");
+            return;
+        }
+        _steam = true;
+        if (role == SessionRole.Host)
+        {
+            _steamLobbyCreate = true;
+            _steamLobbyCall = SteamP2P.CreateLobbyCall();
+            _log.LogInfo("Network: hosting over Steam (creating friends-only lobby)");
+        }
+        else if (SteamP2P.IsLobbyId(target))
+        {
+            // A lobby id (from +connect_lobby or a friend's game info): join it, then talk to its owner.
+            _steamLobbyCreate = false;
+            _steamLobbyCall = SteamP2P.JoinLobbyCall(target);
+            _log.LogInfo($"Network: joining Steam lobby {target}");
+        }
+        else if (target != 0)
+        {
+            _remote = PeerEndpoint.Steam(target);
+            _log.LogInfo($"Network: connecting to {_remote} over Steam");
+        }
+        else
+        {
+            _steam = false;
+            _log.LogError("Network start failed: no Steam host or lobby to join");
+        }
+    }
+
+    private void PumpSteam(float now)
+    {
+        if (_steamLobbyCall != 0)
+        {
+            var state = SteamP2P.PollLobbyCall(_steamLobbyCall, _steamLobbyCreate, out var lobby);
+            if (state < 0)
+            {
+                _steamLobbyCall = 0;
+                _log.LogError(_steamLobbyCreate ? "Network: Steam lobby could not be created" : "Network: Steam lobby could not be joined");
+                if (_role == SessionRole.Client)
+                    _handshakeRejectReason = "Steam lobby could not be joined";
+            }
+            else if (state > 0)
+            {
+                _steamLobbyCall = 0;
+                _steamLobby = lobby;
+                if (_role == SessionRole.Host)
+                {
+                    SteamP2P.TagLobby(lobby, _buildId);
+                    SteamP2P.SetPresence("connect", $"+connect_lobby {lobby}");
+                    SteamP2P.SetPresence("status", "Diving together (hosting)");
+                    _log.LogInfo($"Network: Steam lobby {lobby} ready; friends can join");
+                }
+                else
+                {
+                    var owner = SteamP2P.LobbyOwner(lobby);
+                    if (owner == 0 || owner == SteamP2P.Self)
+                    {
+                        _handshakeRejectReason = "Steam lobby has no host";
+                        _log.LogError("Network: joined Steam lobby has no host");
+                    }
+                    else
+                    {
+                        _remote = PeerEndpoint.Steam(owner);
+                        SteamP2P.SetPresence("status", "Diving together");
+                        _log.LogInfo($"Network: joined Steam lobby {lobby}; connecting to {_remote}");
+                    }
+                }
+            }
+        }
+        // No callbacks here: the host accepts pending Steam sessions from members of its own lobby only.
+        if (_role == SessionRole.Host && _steamLobby != 0 && now >= _nextSteamAccept)
+        {
+            _nextSteamAccept = now + 0.5f;
+            var self = SteamP2P.Self;
+            foreach (var member in SteamP2P.LobbyMembers(_steamLobby))
+                if (member != self)
+                    SteamP2P.Accept(member);
+        }
+        SteamP2P.Receive((from, data) =>
+        {
+            var queuedBefore = Interlocked.Increment(ref _incomingCount) - 1;
+            if (!ShouldAcceptIncoming(queuedBefore))
+            {
+                Interlocked.Decrement(ref _incomingCount);
+                Interlocked.Increment(ref _incomingDropped);
+                return;
+            }
+            _incoming.Enqueue(new Datagram(data, PeerEndpoint.Steam(from)));
+        }, MaxDatagramsPerUpdate);
+    }
+
+    private void StopSteam()
+    {
+        if (!_steam)
+            return;
+        _steam = false;
+        if (_remote?.SteamId != 0 && _remote != null)
+            SteamP2P.Close(_remote.SteamId);
+        SteamP2P.LeaveLobby(_steamLobby);
+        _steamLobby = 0;
+        _steamLobbyCall = 0;
+        SteamP2P.SetPresence("connect", string.Empty);
+        SteamP2P.SetPresence("status", string.Empty);
+    }
+
+    private void SendRaw(byte[] packet, PeerEndpoint to)
+    {
+        if (to.Ip != null)
+            _udp?.Send(packet, packet.Length, to.Ip);
+        else if (_steam && !SteamP2P.Send(to.SteamId, packet, packet.Length))
+            throw new InvalidOperationException("Steam send failed");
+    }
+
     public void Dispose()
     {
-        if (_connected)
+        // Also after a local timeout/reset (_connected already false), so the host drops this peer at once
+        // instead of keeping a ghost for 5 s and ignoring a quick rejoin.
+        if (_connected || _remote != null)
             Send(PacketType.Disconnect);
         _stop.Cancel();
         _udp?.Dispose();
         _udp = null;
+        StopSteam();
         _receiveFailed = false;
         ResetPeerState();
     }

@@ -22,6 +22,12 @@ internal static class TitleOnlineMenu
     private const int Back = 106;
     private const int Ready = 107;
     private const int Start = 108;
+    private const int HostSteam = 109;
+    private const int InviteSteam = 110;
+    private const int RefreshSteam = 111;
+    private const int JoinSteamFriend = 120; // 120..127: one button per friend hosting
+    private const int MaxSteamFriends = 8;
+    private const int LastAction = JoinSteamFriend + MaxSteamFriends - 1;
     private const string OnlineObjectName = "DaveTheDiverMP_Online";
 
     private enum OnlineText
@@ -44,7 +50,13 @@ internal static class TitleOnlineMenu
         WaitingForHostRoom,
         LocalNetwork,
         StartingCampaign,
-        HostDisconnected
+        HostDisconnected,
+        HostSteam,
+        JoinSteamFriend,
+        RefreshSteam,
+        InviteSteam,
+        SteamHosting,
+        JoinByIp
     }
 
     // Korean, English, Japanese, Chinese, Chinese Traditional, French, Italian, German, Spanish, Portuguese, Russian.
@@ -68,9 +80,18 @@ internal static class TitleOnlineMenu
         new[] { "호스트 방 대기 중", "Waiting for host room", "ホストのルームを待機中", "等待主机房间", "等待主機房間", "En attente du salon hôte", "In attesa della stanza host", "Warte auf Host-Lobby", "Esperando sala del anfitrión", "Aguardando sala do anfitrião", "Ожидание комнаты хоста" },
         new[] { "LAN", "LAN", "LAN", "局域网", "區域網路", "Réseau local", "Rete locale", "Lokales Netzwerk", "Red local", "Rede local", "Локальная сеть" },
         new[] { "캠페인을 시작하는 중...", "Starting campaign...", "キャンペーンを開始中...", "正在开始战役...", "正在開始戰役...", "Démarrage de la campagne...", "Avvio della campagna...", "Kampagne wird gestartet...", "Iniciando campaña...", "Iniciando campanha...", "Запуск кампании..." },
-        new[] { "호스트와 연결이 끊겼습니다", "Host disconnected", "ホストとの接続が切れました", "主机已断开连接", "主機已中斷連線", "L’hôte s’est déconnecté", "L'host si è disconnesso", "Host getrennt", "El anfitrión se desconectó", "Anfitrião desconectado", "Хост отключился" }
+        new[] { "호스트와 연결이 끊겼습니다", "Host disconnected", "ホストとの接続が切れました", "主机已断开连接", "主機已中斷連線", "L’hôte s’est déconnecté", "L'host si è disconnesso", "Host getrennt", "El anfitrión se desconectó", "Anfitrião desconectado", "Хост отключился" },
+        new[] { "Steam으로 호스트", "Host on Steam", "Steamでホスト", "通过 Steam 主持", "透過 Steam 主持", "Héberger via Steam", "Ospita su Steam", "Über Steam hosten", "Anfitrión en Steam", "Hospedar no Steam", "Хост через Steam" },
+        new[] { "참가", "Join", "参加", "加入", "加入", "Rejoindre", "Unisciti", "Beitreten", "Unirse", "Entrar", "Подключиться" },
+        new[] { "Steam 친구 새로고침", "Refresh Steam friends", "Steamフレンドを更新", "刷新 Steam 好友", "重新整理 Steam 好友", "Actualiser les amis Steam", "Aggiorna amici Steam", "Steam-Freunde aktualisieren", "Actualizar amigos de Steam", "Atualizar amigos do Steam", "Обновить друзей Steam" },
+        new[] { "친구 초대", "Invite a friend", "フレンドを招待", "邀请好友", "邀請好友", "Inviter un ami", "Invita un amico", "Freund einladen", "Invitar a un amigo", "Convidar um amigo", "Пригласить друга" },
+        new[] { "Steam 로비", "Steam lobby", "Steamロビー", "Steam 大厅", "Steam 大廳", "Salon Steam", "Lobby Steam", "Steam-Lobby", "Sala de Steam", "Sala do Steam", "Лобби Steam" },
+        new[] { "IP로 참가 (LAN)", "Join by IP (LAN)", "IPで参加 (LAN)", "通过 IP 加入 (局域网)", "透過 IP 加入 (區域網路)", "Rejoindre par IP (LAN)", "Unisciti tramite IP (LAN)", "Per IP beitreten (LAN)", "Unirse por IP (LAN)", "Entrar por IP (LAN)", "Подключиться по IP (LAN)" }
     };
 
+    private static readonly List<SteamP2P.HostingFriend> SteamFriends = new();
+    private static float _nextSteamFriendScan;
+    private static bool _steamAutoJoinDone;
     private static readonly List<TitleMenuButton> TitleButtons = new();
     private static readonly List<TitleMenuButton> RoomButtons = new();
     private static readonly List<TitleMenuButton> RoomLabels = new();
@@ -172,7 +193,32 @@ internal static class TitleOnlineMenu
         manager.buttons.Insert(sourceIndex + 1, button);
         ProbeBehaviour.Logger?.LogInfo("Title online entry added");
         OpenAfterHostLoss(manager);
+        TryAutoJoinSteamLobby(manager);
     }
+
+    // Lab driver (-dtmp-lab): press a room action as a player would, with the address typed in first.
+    internal static bool LabPress(TitleManager manager, string action, string address, string port, string name)
+    {
+        _address = address ?? _address;
+        _port = port ?? _port;
+        _name = name ?? _name;
+        var code = action switch
+        {
+            "online" => Online,
+            "host" => Host,
+            "join" => Join,
+            "ready" => Ready,
+            "start" => Start,
+            _ => 0
+        };
+        if (code == Ready && _clientReady)
+            return true;
+        return code != 0 && TryHandle(manager, (ButtonName)code);
+    }
+
+    internal static bool LabVisible => _visible;
+    internal static bool LabClientReady => _clientReady;
+    internal static bool LabRemoteReady => _remoteReady;
 
     internal static bool TryHandle(TitleManager manager, ButtonName action)
     {
@@ -186,7 +232,7 @@ internal static class TitleOnlineMenu
             Open(manager);
             return true;
         }
-        if (!_visible || manager != _manager || code is < Host or > Start)
+        if (!_visible || manager != _manager || code is < Host or > LastAction)
             return false;
 
         switch (code)
@@ -207,6 +253,25 @@ internal static class TitleOnlineMenu
 
         switch (code)
         {
+            case HostSteam:
+                if (!probe.SwitchTitleSession(SessionRole.Host, SteamP2P.AddressPrefix, _port, _name, out _message))
+                    break;
+                ResetHostRoom();
+                break;
+            case InviteSteam:
+                SteamP2P.InviteOverlay(probe._session?.SteamLobby ?? 0);
+                return true;
+            case RefreshSteam:
+                RefreshSteamFriends(true);
+                break;
+            case >= JoinSteamFriend and <= LastAction:
+                var index = code - JoinSteamFriend;
+                if (index >= SteamFriends.Count)
+                    break;
+                if (!probe.SwitchTitleSession(SessionRole.Client, SteamP2P.AddressOf(SteamFriends[index].Lobby), _port, _name, out _message))
+                    break;
+                ResetClientRoom();
+                break;
             case Host:
                 if (!probe.SwitchTitleSession(SessionRole.Host, _address, _port, _name, out _message))
                     break;
@@ -270,9 +335,66 @@ internal static class TitleOnlineMenu
         return true;
     }
 
+    private static void ResetHostRoom()
+    {
+        MultiplayerSaveSync.Reset();
+        _roomId = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
+        _remoteReady = false;
+        _hostStateSent = false;
+        _lastSentRemoteReady = false;
+        _lastRemoteReadyRevision = 0;
+        _stateRevision = 0;
+    }
+
+    private static void ResetClientRoom()
+    {
+        MultiplayerSaveSync.Reset();
+        _clientReady = false;
+        _readyRevision = 1;
+        _readySentForRoom = 0;
+        _roomId = 0;
+        _lastStateRevision = 0;
+        _clientWasConnected = false;
+    }
+
+    // Friends in Dave the Diver who are in a lobby; rescanned every few seconds while the menu is open.
+    private static void RefreshSteamFriends(bool force)
+    {
+        var now = Time.realtimeSinceStartup;
+        if (!force && now < _nextSteamFriendScan)
+            return;
+        _nextSteamFriendScan = now + 3f;
+        var found = SteamP2P.FriendsHosting();
+        var changed = found.Count != SteamFriends.Count;
+        for (var i = 0; !changed && i < found.Count; i++)
+            changed = found[i].Lobby != SteamFriends[i].Lobby;
+        if (!changed)
+            return;
+        SteamFriends.Clear();
+        SteamFriends.AddRange(found.Count > MaxSteamFriends ? found.GetRange(0, MaxSteamFriends) : found);
+        MarkDirty();
+    }
+
+    // Steam's Join Game / invite before the game was running starts it with +connect_lobby <id>: open the room
+    // and join that lobby once the title menu is up.
+    private static void TryAutoJoinSteamLobby(TitleManager manager)
+    {
+        if (_steamAutoJoinDone)
+            return;
+        var lobby = SteamP2P.LobbyFromCommandLine();
+        _steamAutoJoinDone = true;
+        var probe = ProbeBehaviour.Instance;
+        if (lobby == 0 || probe == null || ProbeBehaviour.Role != SessionRole.Offline)
+            return;
+        Open(manager);
+        if (probe.SwitchTitleSession(SessionRole.Client, SteamP2P.AddressOf(lobby), _port, _name, out _message))
+            ResetClientRoom();
+        MarkDirty();
+    }
+
     internal static bool TryHandleButton(TitleMenuButton button)
     {
-        if (button == null || (int)button.buttonName is < Online or > Start)
+        if (button == null || (int)button.buttonName is < Online or > LastAction)
             return false;
         var manager = _manager ?? UnityEngine.Object.FindFirstObjectByType<TitleManager>();
         return manager != null && TryHandle(manager, button.buttonName);
@@ -285,6 +407,8 @@ internal static class TitleOnlineMenu
     {
         if (!_visible || _manager == null || probe == null)
             return;
+        if (ProbeBehaviour.Role == SessionRole.Offline)
+            RefreshSteamFriends(false);
 
         if (!_keyboardVisible && UnityEngine.Input.GetKeyDown(KeyCode.Escape))
         {
@@ -531,10 +655,19 @@ internal static class TitleOnlineMenu
         if (ProbeBehaviour.Role == SessionRole.Offline)
         {
             AddInput(OnlineText.Name, _name, EditName);
+            // Online play is Steam: host a friends-only lobby, or join a friend who is hosting one.
+            AddAction(language => Text(OnlineText.HostSteam, language), HostSteam);
+            for (var i = 0; i < SteamFriends.Count; i++)
+            {
+                var friend = SteamFriends[i];
+                AddAction(language => $"{Text(OnlineText.JoinSteamFriend, language)}: {Protocol.NormalizePlayerName(friend.Name)}", JoinSteamFriend + i);
+            }
+            AddAction(language => Text(OnlineText.RefreshSteam, language), RefreshSteam);
+            // LAN fallback: direct UDP on the same network (or a VPN).
             AddInput(OnlineText.HostIp, _address, EditHostIp);
             AddInput(OnlineText.Port, _port, EditPort);
-            AddAction(language => Text(OnlineText.CreateLobby, language), Host);
-            AddAction(language => Text(OnlineText.Join, language), Join);
+            AddAction(language => $"{Text(OnlineText.CreateLobby, language)} (LAN)", Host);
+            AddAction(language => Text(OnlineText.JoinByIp, language), Join);
             AddAction(language => Text(OnlineText.Back, language), Back);
         }
         else if (ProbeBehaviour.Role == SessionRole.Host)
@@ -543,7 +676,14 @@ internal static class TitleOnlineMenu
             AddLabel(language => session != null && session.Connected
                 ? $"{Value(OnlineText.PlayerTwo, session.RemoteName, language)} — {Text(_remoteReady ? OnlineText.Ready : OnlineText.NotReady, language)}"
                 : Value(OnlineText.PlayerTwo, Text(OnlineText.Waiting, language), language));
-            AddLabel(language => $"{Text(OnlineText.LocalNetwork, language)}: {probe?.TitleLanAddress ?? "unknown"}:{ProbeBehaviour.Port}");
+            if (session != null && session.IsSteam)
+            {
+                AddLabel(language => Text(OnlineText.SteamHosting, language) +
+                    (session.SteamLobby != 0 ? string.Empty : " …"));
+                AddAction(language => Text(OnlineText.InviteSteam, language), InviteSteam);
+            }
+            else
+                AddLabel(language => $"{Text(OnlineText.LocalNetwork, language)}: {probe?.TitleLanAddress ?? "unknown"}:{ProbeBehaviour.Port}");
             if (session != null && session.Connected && _remoteReady &&
                 MultiplayerSaveSync.HostRemoteLoaded)
                 AddAction(language => Text(OnlineText.Start, language), Start);

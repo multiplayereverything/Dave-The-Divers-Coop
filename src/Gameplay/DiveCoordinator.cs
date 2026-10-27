@@ -34,6 +34,7 @@ internal sealed class DiveCoordinator
     private bool _hostExitReady;
     private bool _clientExitReady;
     private LobbyStartGamePanelUI _panel;
+    private float _layoutWaitSince = -1f;
     private StartParameter _startParameter;
     private TMP_Text _buttonLabel;
     private string _nativeButtonText;
@@ -71,6 +72,7 @@ internal sealed class DiveCoordinator
             !HasRequiredExitConfirmations(true, false, false, true) ||
             !HasRequiredExitConfirmations(false, true, true, false) ||
             HasRequiredExitConfirmations(false, true, false, true) ||
+            !HasRequiredExitConfirmations(true, true, false, false) ||
              !ShouldStartClientDive(true, true, false) ||
             ShouldStartClientDive(false, true, false) ||
             ShouldStartClientDive(true, true, true) ||
@@ -168,6 +170,9 @@ internal sealed class DiveCoordinator
                 _remoteLifeRevision = life.Revision;
                 _clientDead = life.IsDead;
                 _log.LogInfo(_clientDead ? "Dive: client died" : "Dive: client revived");
+                // A dead host already waits in spectator mode: the client's death can be the last thing needed.
+                if (_clientDead && _hostDead)
+                    TryStartHostExit(null);
             }
             while (session.TryTakeDiveExitRequest(out var request))
             {
@@ -232,6 +237,7 @@ internal sealed class DiveCoordinator
             _allowNativeStart, _allowNativeExit) =
             (false, false, false, false, false, false);
         _clientDiveRequested = false;
+        _layoutWaitSince = -1f;
         (_hostDead, _clientDead) = (false, false);
         _localSpectating = false;
         (_hostExitReady, _clientExitReady) = (false, false);
@@ -260,14 +266,34 @@ internal sealed class DiveCoordinator
 
     private void TryStartClientDive(UdpSession session, float now)
     {
+        // The host's dive transition is itself proof that the host started the dive. When the client was ready
+        // first, the host's "ready" state and its scene change leave in the same frame and the ready state can
+        // lose the race (the old check then left the client on the boat for good).
+        if (LabMode.IsMutant("dive-follow"))
+            return;
+        var hostReady = _hostReady || !LabMode.IsMutant("dive-race") && _clientReady;
+        // The host's layer layout is sent just before its transition; give a late one up to 2 s.
+        if (!session.HasDiveLayout && _layoutWaitSince >= 0f && now - _layoutWaitSince < 2f)
+            return;
+        if (session.HasDiveLayout)
+            _layoutWaitSince = 0f;
+        else if (_layoutWaitSince < 0f)
+        {
+            _layoutWaitSince = now;
+            return;
+        }
         if (_panel == null ||
-            !ShouldStartClientDive(_hostReady, _clientReady, _clientNativeStartRequested) ||
+            !ShouldStartClientDive(hostReady, _clientReady, _clientNativeStartRequested) ||
             !session.TryTakeDiveSceneTransition(out var transition))
             return;
+        if (!_hostReady)
+            _log.LogInfo("Dive: host transition arrived before its ready state; treating the host as ready");
+        _hostReady = true;
 
         FishSpawnSeedCoordinator.StageRemoteScene(
             new SceneSeed(transition.SceneId, transition.SceneEpoch, transition.Seed));
         _clientNativeStartRequested = true;
+        _layoutWaitSince = -1f;
         _allowNativeStart = true;
         RefreshPrompt(session, now);
         var probe = ProbeBehaviour.Instance;
@@ -350,6 +376,8 @@ internal sealed class DiveCoordinator
             return true;
         if (role == SessionRole.Client)
         {
+            if (LabMode.IsMutant("dive-exit"))
+                return false;
             _clientExitReady = true;
             _exitRevision = NextRevision(_exitRevision);
             session.SendDiveExitRequest(new DiveExitRequest(_exitRevision));
@@ -397,6 +425,8 @@ internal sealed class DiveCoordinator
         session.SendDiverLifeState(new DiverLifeState(_lifeRevision, dead));
         _log.LogInfo($"Dive: {(role == SessionRole.Host ? "host" : "client")} " +
             (dead ? "reported death" : "reported revive"));
+        if (role == SessionRole.Host && _hostDead && _clientDead)
+            TryStartHostExit(null);
     }
 
     private void TryStartHostExit(SceneExitTrigger trigger)
@@ -409,6 +439,14 @@ internal sealed class DiveCoordinator
             return;
         }
         trigger ??= FindLoadedExitTrigger();
+        // Party wipe before the host's own death sequence reached GoToLobby: end the dive through the game's
+        // InGameManager, as that sequence would.
+        if (_exitManager == null && trigger == null && _hostDead && _clientDead && InGameManager.hasInstance &&
+            !LabMode.IsMutant("party-wipe"))
+        {
+            _exitManager = InGameManager.Instance;
+            _exitColor = default;
+        }
         if (_exitManager == null && trigger == null)
         {
             _log.LogWarning("Dive: exit requested but no native exit route is loaded");
@@ -449,8 +487,9 @@ internal sealed class DiveCoordinator
     {
         if (!hostDead && !clientDead)
             return hostExitReady && clientExitReady;
+        // Party wipe: nobody is left to confirm, so the dive ends (both used to stay in spectator mode forever).
         if (hostDead && clientDead)
-            return hostExitReady || clientExitReady;
+            return !LabMode.IsMutant("party-wipe") || hostExitReady || clientExitReady;
         return hostDead ? clientExitReady : hostExitReady;
     }
 
@@ -475,7 +514,7 @@ internal sealed class DiveCoordinator
             var waterline = float.NaN;
             try
             {
-                var manager = InGameManager.Instance;
+                var manager = (InGameManager.hasInstance ? InGameManager.Instance : null);
                 if (manager != null)
                     waterline = manager.surfaceHeight;
             }
@@ -527,7 +566,7 @@ internal sealed class DiveCoordinator
     {
         if (_localSpectating || remoteAvatar == null)
             return;
-        var camera = CameraManager.Instance;
+        var camera = (CameraManager.hasInstance ? CameraManager.Instance : null);
         if (camera == null)
             return;
         camera.ChangeTarget(remoteAvatar);
@@ -540,7 +579,7 @@ internal sealed class DiveCoordinator
         if (!_localSpectating)
             return;
         var player = UnityEngine.Object.FindFirstObjectByType<PlayerCharacter>();
-        if (player != null && CameraManager.Instance != null)
+        if (player != null && (CameraManager.hasInstance ? CameraManager.Instance : null) != null)
             CameraManager.Instance.ChangeTarget(player.transform);
         _localSpectating = false;
     }

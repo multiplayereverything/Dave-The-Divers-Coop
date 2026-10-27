@@ -89,7 +89,9 @@ internal sealed class NpcInteractionCoordinator
         if (!connected)
             return;
 
-        var epoch = role == SessionRole.Host ? session.LocalSceneEpoch : session.RemoteSceneEpoch;
+        // A lease is scoped to the client's scene epoch on both sides (the client's local epoch is the host's remote
+        // one); comparing against the other side's counter cleared every lease on the next frame.
+        var epoch = role == SessionRole.Host ? session.RemoteSceneEpoch : session.LocalSceneEpoch;
         if ((_token != 0 || _hostBusy) && !ScopeMatches(_sceneId, _sceneEpoch, sceneId, epoch))
             LocalClear();
 

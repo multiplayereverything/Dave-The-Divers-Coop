@@ -103,7 +103,7 @@ internal static class SceneMetadataResolver
             var routeTid = 0;
             try
             {
-                var dataManager = DataManager.Instance;
+                var dataManager = (DataManager.hasInstance ? DataManager.Instance : null);
                 sceneData = dataManager?.GetScene(sceneName);
                 routeTid = dataManager?.GetSceneTID(sceneName) ?? 0;
             }
