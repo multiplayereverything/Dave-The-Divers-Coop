@@ -31,7 +31,18 @@ try {
     }
     $archive = Join-Path $OutputDirectory "DaveTheDiverMP-$Version.zip"
     if (Test-Path $archive) { Remove-Item -LiteralPath $archive -Force }
-    Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive
+    # Not Compress-Archive: Windows PowerShell 5.1 writes "\" into entry names, which other unzip tools mishandle.
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::Open($archive, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) {
+            $entry = $file.FullName.Substring($stage.Length).TrimStart('\', '/') -replace '\\', '/'
+            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file.FullName, $entry) | Out-Null
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
     $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $archive
     $checksum = "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)"
     Set-Content -LiteralPath "$archive.sha256" -Value $checksum -Encoding ASCII
