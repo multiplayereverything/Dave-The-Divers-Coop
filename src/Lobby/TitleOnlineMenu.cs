@@ -400,6 +400,23 @@ internal static class TitleOnlineMenu
         return manager != null && TryHandle(manager, button.buttonName);
     }
 
+    // Esc leaves the room only when no session is running. Closing Steam's overlay ("Invite a friend") with Esc
+    // reaches the game too; it used to end the host's session right after the lobby went up, so the friend who
+    // joined never got a room or a Ready button. A running session ends only through Back.
+    private static bool HandleEscape(ProbeBehaviour probe)
+    {
+        if (ProbeBehaviour.Role != SessionRole.Offline && !LabMode.IsMutant("escape-leaves"))
+        {
+            ProbeBehaviour.Logger?.LogInfo("Online room: Esc ignored while a session is running (use Back)");
+            return false;
+        }
+        probe.SwitchTitleSession(SessionRole.Offline, _address, _port, _name, out _);
+        Close();
+        return true;
+    }
+
+    internal static bool LabEscape(ProbeBehaviour probe) => _visible && HandleEscape(probe);
+
     internal static bool IsKeyboardVisible(TitleManager manager) =>
         _keyboardVisible && manager == _manager;
 
@@ -410,12 +427,8 @@ internal static class TitleOnlineMenu
         if (ProbeBehaviour.Role == SessionRole.Offline)
             RefreshSteamFriends(false);
 
-        if (!_keyboardVisible && UnityEngine.Input.GetKeyDown(KeyCode.Escape))
-        {
-            probe.SwitchTitleSession(SessionRole.Offline, _address, _port, _name, out _);
-            Close();
+        if (!_keyboardVisible && UnityEngine.Input.GetKeyDown(KeyCode.Escape) && HandleEscape(probe))
             return;
-        }
 
         var session = probe._session;
         if (ProbeBehaviour.Role == SessionRole.Host && session != null)

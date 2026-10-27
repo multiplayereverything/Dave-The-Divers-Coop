@@ -37,6 +37,7 @@ internal static class LabMode
     private static bool _loggedConnected;
     private static bool _loggedSave;
     private static bool _dumped;
+    private static bool _pressedEscape;
     private static string _lastSaveStatus = string.Empty;
 
     // -dtmp-mutant takes one name or a comma-separated list (mutants that target different checks).
@@ -220,6 +221,16 @@ internal static class LabMode
             if (TitleOnlineMenu.LabPress(manager, "join", join, Port, Name))
                 Log($"joining {join}");
             return;
+        }
+        // Regression: Esc (closing Steam's invite overlay) while hosting must not end the session.
+        if (ProbeBehaviour.Role == SessionRole.Host && !_pressedEscape &&
+            Environment.CommandLine.Contains("-dtmp-press-escape") && session != null && session.IsRunning)
+        {
+            _pressedEscape = true;
+            var left = TitleOnlineMenu.LabEscape(probe);
+            Log($"pressed-escape left={left} role={ProbeBehaviour.Role}");
+            if (left)
+                return;
         }
         if (session == null || !session.Connected)
             return;

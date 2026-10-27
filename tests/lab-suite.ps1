@@ -5,7 +5,7 @@
 #   tests\lab-suite.ps1 -Steam               Steam path through SteamMock (lobby, owner lookup, session accept)
 #   tests\lab-suite.ps1 -Mutant party-wipe   must fail "death"
 #   tests\lab-suite.ps1 -Chaos               120 ms lag + 5% loss between the copies (tests\chaos-proxy.py)
-param([switch]$Steam, [string]$Mutant = '', [string]$StopAfter = '', [int]$TimeoutSeconds = 900, [switch]$Chaos, [switch]$KeepRunning)
+param([switch]$Steam, [string]$Mutant = '', [string]$StopAfter = '', [string]$HostExtra = '', [int]$TimeoutSeconds = 900, [switch]$Chaos, [switch]$KeepRunning)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $scripts = Join-Path $root 'scripts'
@@ -16,6 +16,7 @@ Remove-Item (Join-Path $root 'private\steam-mock') -Recurse -Force -ErrorAction 
 
 $extra = if ($Mutant) { " -dtmp-mutant $Mutant" } else { '' }
 if ($StopAfter) { $extra += " -dtmp-stop-after $StopAfter" }
+$hostExtra = if ($HostExtra) { " $HostExtra" } else { '' }
 $port = 27877
 $chaosProc = $null
 if ($Chaos) {
@@ -24,10 +25,10 @@ if ($Chaos) {
     $joinPort = 27878
 } else { $joinPort = $port }
 if ($Steam) {
-    $hostArgs = "-dtmp-host steam -dtmp-steam-mock 1 -dtmp-tour features$extra"
+    $hostArgs = "-dtmp-host steam -dtmp-steam-mock 1 -dtmp-tour features$extra$hostExtra"
     $clientArgs = "-dtmp-join steam -dtmp-steam-mock 2 -dtmp-tour features$extra"
 } else {
-    $hostArgs = "-dtmp-host lan -dtmp-port $port -dtmp-tour features$extra"
+    $hostArgs = "-dtmp-host lan -dtmp-port $port -dtmp-tour features$extra$hostExtra"
     $clientArgs = "-dtmp-join 127.0.0.1 -dtmp-port $joinPort -dtmp-tour features$extra"
 }
 & (Join-Path $scripts 'launch-lab.ps1') -Names host, client -HostArgs $hostArgs -ClientArgs $clientArgs | Out-Null

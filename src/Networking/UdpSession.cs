@@ -292,6 +292,8 @@ internal sealed class UdpSession : IDisposable
     private ulong _steamLobbyCall;
     private bool _steamLobbyCreate;
     private float _nextSteamAccept;
+    private int _steamLobbyRetries;
+    private ulong _steamJoinTarget;
     private SessionRole _role;
     private string _localName = "Diver";
     private string _remoteName = "Diver";
@@ -4829,6 +4831,7 @@ internal sealed class UdpSession : IDisposable
         {
             // A lobby id (from +connect_lobby or a friend's game info): join it, then talk to its owner.
             _steamLobbyCreate = false;
+            _steamJoinTarget = target;
             _steamLobbyCall = SteamP2P.JoinLobbyCall(target);
             _log.LogInfo($"Network: joining Steam lobby {target}");
         }
@@ -4849,7 +4852,16 @@ internal sealed class UdpSession : IDisposable
         if (_steamLobbyCall != 0)
         {
             var state = SteamP2P.PollLobbyCall(_steamLobbyCall, _steamLobbyCreate, out var lobby);
-            if (state < 0)
+            if (state < 0 && _steamLobbyRetries < 3)
+            {
+                // Steam sometimes refuses a lobby call right after the previous lobby was left; try again.
+                _steamLobbyRetries++;
+                _log.LogWarning($"Network: Steam lobby call failed; retry {_steamLobbyRetries}/3");
+                _steamLobbyCall = _steamLobbyCreate
+                    ? SteamP2P.CreateLobbyCall()
+                    : SteamP2P.JoinLobbyCall(_steamJoinTarget);
+            }
+            else if (state < 0)
             {
                 _steamLobbyCall = 0;
                 _log.LogError(_steamLobbyCreate ? "Network: Steam lobby could not be created" : "Network: Steam lobby could not be joined");
