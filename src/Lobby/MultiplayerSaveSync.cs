@@ -609,9 +609,29 @@ internal static class MultiplayerSaveSync
         }
         catch (Exception exception)
         {
-            _status = "Could not restore original client profile; remaining online";
             log?.LogWarning($"MP save sync: original profile restore failed: {exception.Message}");
-            return false;
+            // The in-memory JSON round trip fails on this game build. The player's own saves on disk were never
+            // touched (DTMP only writes slot 7 and blocks the client's saves), so reload them from disk instead
+            // of leaving the host's campaign loaded (that left the game on a black screen after a session).
+            try
+            {
+                if (LabMode.IsMutant("restore-disk"))
+                    throw new InvalidOperationException("lab mutant");
+                save.LoadAllData();
+                _originalGameJson = string.Empty;
+                _originalPhotoJson = string.Empty;
+                _originalPlayerJson = string.Empty;
+                _originalProfileRestoreRequired = false;
+                _status = "Original profile reloaded from disk; restart the game before playing solo";
+                log?.LogInfo("MP save sync: reloaded the player's own profile from disk");
+                return true;
+            }
+            catch (Exception fallback)
+            {
+                _status = "Could not restore original client profile; restart the game";
+                log?.LogWarning($"MP save sync: profile reload from disk failed: {fallback.Message}");
+                return false;
+            }
         }
     }
 

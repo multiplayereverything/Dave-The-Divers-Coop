@@ -161,6 +161,8 @@ internal static class LabMode
         {
             _loggedSave = true;
             Log($"save-synced status={MultiplayerSaveSync.Status}");
+            if (Environment.CommandLine.Contains("-dtmp-restore-test") && MultiplayerSaveSync.ClientLoaded)
+                Log($"restore-test ok={MultiplayerSaveSync.TryRestoreOriginalProfile(_log)} status={MultiplayerSaveSync.Status}");
         }
         if (!_dumped && Environment.CommandLine.Contains("-dtmp-dump-slot") &&
             UnityEngine.Object.FindFirstObjectByType<TitleManager>() != null)
