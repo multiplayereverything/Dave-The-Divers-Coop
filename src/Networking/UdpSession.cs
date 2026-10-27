@@ -1548,7 +1548,6 @@ internal sealed class UdpSession : IDisposable
         _lastDiverVitalCommitRevision);
     internal PacketReceiveDiagnostics[] PacketReceiveDiagnostics =>
         SnapshotPacketReceiveDiagnostics();
-    internal int PendingReliableCount => _pendingReliable.Count;
     internal int ReliableBacklogCount => _reliableBacklog.Count + _reliableBulkBacklog.Count;
     internal int ReliableCapacityRemaining => ReliableBacklogCount == 0
         ? Math.Max(0, 256 - _pendingReliable.Count)
@@ -2935,8 +2934,11 @@ internal sealed class UdpSession : IDisposable
 
         if (type == PacketType.Ack)
         {
-            if (_connected && _pendingReliable.Remove(sequence))
+            if (_connected && _pendingReliable.Remove(sequence, out var acked))
+            {
                 _lastReceive = now;
+                ObserveAck(acked, now);
+            }
             return;
         }
 
@@ -4011,14 +4013,34 @@ internal sealed class UdpSession : IDisposable
         return unchecked(controlSequence - bulkSequence) < ReliableReceiveWindowSize;
     }
 
+    // Retransmit timeout from the measured round trip (smoothed, like TCP). A fixed 0.1 s timeout re-sent
+    // everything in flight several times per round trip over Steam's relay; with a whole save in flight that
+    // filled Steam's send buffer until nothing (not even keepalives) got through and the client timed out.
+    private float _smoothedRtt = 0.15f;
+    private float RetransmitTimeout => LabMode.IsMutant("fixed-retry")
+        ? 0.1f
+        : Math.Clamp(_smoothedRtt * 2f + 0.05f, 0.15f, 2f);
+
+    private void ObserveAck(PendingReliable pending, float now)
+    {
+        if (pending.Attempts != 1 || now < pending.FirstSend)
+            return;
+        var rtt = now - pending.FirstSend;
+        _smoothedRtt += (rtt - _smoothedRtt) * 0.125f;
+    }
+
+    internal int PendingReliableCount => _pendingReliable.Count;
+    internal float SmoothedRtt => _smoothedRtt;
+
     private void TrackReliable(byte[] packet, uint sequence)
     {
+        var timeout = RetransmitTimeout;
         _pendingReliable[sequence] = new PendingReliable
         {
             Packet = packet,
             FirstSend = _now,
-            NextSend = _now + 0.1f,
-            RetryDelay = 0.1f,
+            NextSend = _now + timeout,
+            RetryDelay = timeout,
             Attempts = 1
         };
         Send(packet);
@@ -4042,7 +4064,7 @@ internal sealed class UdpSession : IDisposable
             Send(pending.Packet);
             pending.Attempts++;
             Interlocked.Increment(ref _reliableRetries);
-            pending.RetryDelay = Math.Min(1f, pending.RetryDelay * 2f);
+            pending.RetryDelay = Math.Min(LabMode.IsMutant("fixed-retry") ? 1f : 2f, pending.RetryDelay * 2f);
             pending.NextSend = now + pending.RetryDelay;
         }
         if (expired == null)

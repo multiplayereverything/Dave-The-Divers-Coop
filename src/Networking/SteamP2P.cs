@@ -58,6 +58,10 @@ internal static unsafe class SteamP2P
     [DllImport(Lib)] private static extern IntPtr SteamAPI_SteamUtils_v010();
     [DllImport(Lib)] private static extern ulong SteamAPI_ISteamUser_GetSteamID(IntPtr self);
     [DllImport(Lib)] private static extern void SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess(IntPtr self);
+    [DllImport(Lib)] [return: MarshalAs(UnmanagedType.I1)] private static extern bool SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32(IntPtr self, int value, int setting);
+    private const int ConfigSendBufferSize = 9;
+    private const int ConfigSendRateMin = 10;
+    private const int ConfigSendRateMax = 11;
     [DllImport(Lib)] private static extern void SteamAPI_SteamNetworkingIdentity_SetSteamID64(ref Identity identity, ulong id);
     [DllImport(Lib)] private static extern ulong SteamAPI_SteamNetworkingIdentity_GetSteamID64(IntPtr identity);
     [DllImport(Lib)] private static extern int SteamAPI_ISteamNetworkingMessages_SendMessageToUser(IntPtr self, ref Identity remote, byte* data, uint size, int flags, int channel);
@@ -121,7 +125,13 @@ internal static unsafe class SteamP2P
                     return false;
                 }
                 if (_utils != IntPtr.Zero)
+                {
                     SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess(_utils);
+                    // Room for a save transfer next to game traffic: 2 MB buffer, 256 KB/s to 2 MB/s.
+                    SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32(_utils, ConfigSendBufferSize, 2 * 1024 * 1024);
+                    SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32(_utils, ConfigSendRateMin, 256 * 1024);
+                    SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32(_utils, ConfigSendRateMax, 2 * 1024 * 1024);
+                }
                 return true;
             }
             catch (Exception exception)

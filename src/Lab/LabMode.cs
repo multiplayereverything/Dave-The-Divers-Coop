@@ -36,6 +36,7 @@ internal static class LabMode
     private static string _lastScene = string.Empty;
     private static bool _loggedConnected;
     private static bool _loggedSave;
+    private static bool _dumped;
     private static string _lastSaveStatus = string.Empty;
 
     // -dtmp-mutant takes one name or a comma-separated list (mutants that target different checks).
@@ -160,6 +161,12 @@ internal static class LabMode
         {
             _loggedSave = true;
             Log($"save-synced status={MultiplayerSaveSync.Status}");
+        }
+        if (!_dumped && Environment.CommandLine.Contains("-dtmp-dump-slot") &&
+            UnityEngine.Object.FindFirstObjectByType<TitleManager>() != null)
+        {
+            _dumped = MultiplayerSaveSync.LabDumpSlot(Paths.GameRootPath, _log);
+            Log($"slot-dump {_dumped}");
         }
         TickTitle(probe, session);
         LabTour.Tick(probe);

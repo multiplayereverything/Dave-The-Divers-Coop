@@ -38,6 +38,7 @@ internal static class MultiplayerSaveSync
     private const int MarkerSchema = 3;
     private const int LegacyMarkerSchema = 2;
     private const int MaxBundleBytes = 16 * 1024 * 1024;
+    private const int MaxSaveChunksInFlight = 32;
     private const int MaxMetadataBytes = 64 * 1024;
     private static readonly string MpSlotMarkerPath =
         Path.Combine(Paths.ConfigPath, "DaveTheDiverMP.mp-slot");
@@ -243,8 +244,11 @@ internal static class MultiplayerSaveSync
         if (_hostSnapshot.Length == 0 && !PrepareHostSnapshot(session, log))
             return;
 
+        // At most 32 save chunks unacknowledged at once (about 35 KB): sending the whole save at once flooded
+        // Steam's relay link and starved everything else.
         while (!_hostRemoteLoaded && _hostNextChunk < ChunkCount(_hostSnapshot.Length) &&
-               session.ReliableBulkCapacityRemaining > 0)
+               session.ReliableBulkCapacityRemaining > 0 &&
+               (session.PendingReliableCount < MaxSaveChunksInFlight || LabMode.IsMutant("fixed-retry")))
         {
             var offset = _hostNextChunk * Protocol.MaxSaveSnapshotChunkBytes;
             var count = Math.Min(Protocol.MaxSaveSnapshotChunkBytes, _hostSnapshot.Length - offset);
@@ -452,6 +456,8 @@ internal static class MultiplayerSaveSync
                     _clientTransferId, _clientFingerprint, false));
                 return;
             }
+            var verifyDetails = string.Empty;
+            var writtenFingerprint = fullFingerprint;
             var gameSaved = false;
             var photoSaved = false;
             var playerSaved = false;
@@ -479,8 +485,18 @@ internal static class MultiplayerSaveSync
                 () =>
                 {
                     ThrowIfSelfTestFailure(SaveFailurePoint.Verification);
-                    verified = TryReadSlotBundle(save, out var written, out _) &&
-                        FullFingerprint(written) == fullFingerprint;
+                    // The game re-encodes what it writes (per-account encryption, its own JSON writer), so the
+                    // read-back can differ byte for byte from the host's bundle on another Steam account. Same
+                    // account (the lab) always matched; between two accounts that refused every save.
+                    verified = TryReadSlotBundle(save, out var written, out var readDetails);
+                    if (!verified)
+                        verifyDetails = readDetails;
+                    else
+                        writtenFingerprint = FullFingerprint(written);
+                    if (verified && writtenFingerprint != fullFingerprint)
+                        log?.LogInfo(
+                            $"MP save sync: slot 7 read back {written.Length} bytes (host sent {bytes.Length}); " +
+                            "accepted as re-encoded by the game");
                     if (verified)
                         _normalSaveRestartRequired = true;
                     return verified;
@@ -490,11 +506,15 @@ internal static class MultiplayerSaveSync
                     ThrowIfSelfTestFailure(SaveFailurePoint.Load);
                     return loaded = save.LoadGameDataFromSlot(MpSlotIndex, MpSlotType);
                 },
-                () => CommitSlotWrite(pending, fullFingerprint, log),
+                () => CommitSlotWrite(pending, writtenFingerprint, log),
                 () => RollBackSlotWrite(save, pending, log));
             if (!completed)
             {
-                RejectClientSave(session, "Could not safely load host save");
+                var step = !gameSaved ? "writing game data" : !photoSaved ? "writing photo data" :
+                    !playerSaved ? "writing player data" : !verified ? "reading slot 7 back" :
+                    !loaded ? "loading slot 7" : "updating the slot marker";
+                RejectClientSave(session, $"Could not load host save ({step})");
+                log?.LogWarning($"MP save sync: client failed at {step}; {verifyDetails}");
                 log?.LogWarning(
                     $"MP save sync: client transaction failed; gd={gameSaved}; " +
                     $"pz={photoSaved}; pd={playerSaved}; verified={verified}; loaded={loaded}");
@@ -612,12 +632,24 @@ internal static class MultiplayerSaveSync
         {
             if (!TryReadSlotBundle(save, out previous, out var details))
             {
-                RefuseOccupiedSlot(log, $"slot data is incomplete; {details}");
-                return false;
+                // A slot DTMP owns but the game left half-written (closed or crashed mid-save; seen as an empty
+                // player data file) can't be loaded by anyone, yet it blocked every later session. Keep copies of
+                // the files and rewrite the slot.
+                if (!File.Exists(MpSlotMarkerPath) || LabMode.IsMutant("slot-reclaim") ||
+                    !TryBackUpSlotFiles(save, log))
+                {
+                    RefuseOccupiedSlot(log, $"slot data is incomplete; {details}");
+                    return false;
+                }
+                log?.LogInfo($"MP save sync: reclaimed incomplete slot 7 ({details}); files backed up");
+                previous = Array.Empty<byte>();
             }
-            previousFingerprint = FullFingerprint(previous);
-            if (!TryValidateOwnedMarker(previous, previousFingerprint, log))
-                return false;
+            else
+            {
+                previousFingerprint = FullFingerprint(previous);
+                if (!TryValidateOwnedMarker(previous, previousFingerprint, log))
+                    return false;
+            }
         }
         else if (File.Exists(MpSlotMarkerPath))
         {
@@ -801,6 +833,18 @@ internal static class MultiplayerSaveSync
         }
         RefuseOccupiedSlot(log, "ownership marker is invalid or stale");
         return false;
+    }
+
+    // Lab diagnostics (-dtmp-dump-slot): writes slot 7's decrypted JSON next to the lab copy.
+    internal static bool LabDumpSlot(string folder, ManualLogSource log)
+    {
+        var save = FindSaveSystem(log);
+        if (save?.GameDataManager == null)
+            return false;
+        File.WriteAllText(Path.Combine(folder, "slot7-game.json"), save.GameDataManager.GetDataStringFromFile(MpSlotIndex, MpSlotType) ?? "");
+        File.WriteAllText(Path.Combine(folder, "slot7-photo.json"), save.PhotoDataManager.GetDataStringFromFile(MpSlotIndex, MpSlotType) ?? "");
+        File.WriteAllText(Path.Combine(folder, "slot7-player.json"), save.PlayerDataManager.GetDataStringFromFile(MpSlotIndex, MpSlotType) ?? "");
+        return true;
     }
 
     private static bool TryReadSlotBundle(
@@ -1164,6 +1208,26 @@ internal static class MultiplayerSaveSync
         if (bytes.Length == 0 || bytes.Length > MaxMetadataBytes)
             throw new InvalidDataException("metadata size is invalid");
         WriteAtomicBytes(path, bytes);
+    }
+
+    private static bool TryBackUpSlotFiles(SaveSystem save, ManualLogSource log)
+    {
+        try
+        {
+            var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
+            foreach (var type in new[] { SaveDataType.GameData, SaveDataType.PhotoData, SaveDataType.PlayerData })
+            {
+                var path = save.GetSaveFilePath(type, MpSlotIndex, MpSlotType);
+                if (File.Exists(path))
+                    File.Copy(path, $"{MpSlotMarkerPath}.reclaimed-{stamp}-{Path.GetFileName(path)}", true);
+            }
+            return true;
+        }
+        catch (Exception exception)
+        {
+            log?.LogWarning($"MP save sync: slot 7 backup failed: {exception.Message}");
+            return false;
+        }
     }
 
     private static void NoteSlotLoaded(ManualLogSource log)
